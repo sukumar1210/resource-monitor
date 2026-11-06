@@ -234,8 +234,9 @@ class EndToEnd(unittest.TestCase):
                     'ExecStart=/usr/local/bin/hmon collect\n')
         with open(rule, 'w') as f:
             f.write('d /var/lib/hmon 0755 root root 14d\n')
-        down, keys = hmon.curses.KEY_DOWN, hmon.curses.KEY_F2
-        keys = [keys] + [down] * 6 + [hmon.curses.KEY_LEFT, down, 10, ord('7'), 10, 27]
+        down = hmon.curses.KEY_DOWN
+        keys = ([hmon.curses.KEY_F2] + [down] * 6 + [hmon.curses.KEY_RIGHT, down, hmon.curses.KEY_LEFT, down, 10,
+                ord('7'), 10, 27])
         with mock.patch.object(hmon, 'UNIT_PATH', unit), mock.patch.object(hmon, 'TMPFILES_PATH', rule), \
                 mock.patch.object(hmon.os, 'geteuid', return_value=0), \
                 mock.patch.object(hmon.subprocess, 'run') as run:
@@ -246,9 +247,13 @@ class EndToEnd(unittest.TestCase):
         self.assertIn('what the installer asked', frames[1])
         self.assertRegex(frames[1], r'Sample every\s+60 s\s+about [\d,]+ MB a day')
         self.assertRegex(frames[1], r'Keep\s+14 days\s+about [\d,]+ MB in all')
-        self.assertRegex(frames[8], r'Sample every\s+30 s')  # Left steps through the choices
-        self.assertRegex(frames[11], r'7 days\s+about [\d,]+ MB in all')  # the retention dropdown, filtered
-        self.assertIn('Recording every 30 s, kept 7 days; the hmon service restarted.', frames[13])
+        self.assertRegex(frames[1], r'Mouse\s+on\s+hold Shift \(Option in iTerm2\) to select text')
+        self.assertRegex(frames[8], r'Mouse\s+off\s+dragging selects text')  # Right steps through the choices
+        self.assertRegex(frames[10], r'Sample every\s+30 s')
+        self.assertRegex(frames[13], r'7 days\s+about [\d,]+ MB in all')  # the retention dropdown, filtered
+        self.assertIn('Recording every 30 s, kept 7 days; the hmon service restarted.', frames[15])
+        with open(hmon.CONFIG_PATH) as f:
+            self.assertIn('mouse=off', f.read())
         with open(unit) as f:
             self.assertIn('Environment=HMON_INTERVAL=30\n', f.read())
         with open(rule) as f:

@@ -53,12 +53,16 @@ Linux with systemd and Python 3.7+ (standard library only). Docker is optional.
 curl -fsSL https://github.com/sukumar1210/resource-monitor/releases/latest/download/install.sh | sudo bash
 ```
 
-The installer shows how much disk a day of samples takes on this host at 10 s, 30 s, 1 min and 5 min, then asks how
-often to sample and how many days to keep. Finer samples cost more disk; the viewer can always zoom out.
+On a new install it shows how much disk a day of samples takes on this host at 10 s, 30 s, 1 min and 5 min, then asks
+how often to sample and how many days to keep. Finer samples cost more disk; the viewer can always zoom out. Each step
+is printed as it runs (`==> ...`).
 
 - No questions: `... | sudo INTERVAL=60 RETENTION_DAYS=14 bash`
-- A specific release: `.../releases/download/v0.2.0/install.sh` in place of `.../releases/latest/download/install.sh`.
-- Update: run the install command again; it offers your earlier answers and keeps the data.
+- A specific release: `.../releases/download/v0.2.2/install.sh` in place of `.../releases/latest/download/install.sh`.
+- Update: run the install command again. It keeps your answers and the data without asking; change the answers in
+  F2 Setup or with `sudo hmon configure --interval SECONDS --retention DAYS`.
+- If journald keeps its log in memory (`Storage=volatile`, as with log2ram), the installer says so and moves on: the
+  kernel's OOM reports then won't survive a reboot, though hmon's own samples do.
 - Remove: `... | sudo bash -s -- uninstall` (the data in `/var/lib/hmon` is left for you to delete).
 - From a clone: `sudo ./install.sh`. Without systemd: run `python3 hmon.py collect` from your init system
   (`HMON_DATA_DIR` and `HMON_INTERVAL` set where and how often).
@@ -94,7 +98,9 @@ often to sample and how many days to keep. Finer samples cost more disk; the vie
 
 The mouse works as in htop, acting when the button is released: click a row, a fold marker, a column title (again to
 reverse), a graph tab, a point on the graph, or a function-bar item; the wheel scrolls the table, or moves through
-time over the graph. `-M` turns it off.
+time over the graph. To select and copy text while the mouse is on, hold **Shift** as you drag (Option in iTerm2; Fn,
+or View › Allow Mouse Reporting off, in macOS Terminal), as with htop. Turn the mouse off in F2 Setup (saved), or for
+one run with `-M`.
 
 **Setup (F2).** Enter or a click opens a setting's dropdown, where typing filters the list (`kolk` finds
 `Asia/Kolkata` among the system's time zones, each shown with its UTC offset); Left/Right steps through the choices.

@@ -971,11 +971,11 @@ def configure_recording(interval, days):
 def megabytes_per_day(interval, processes):
     return 86400 / interval * processes * SAMPLE_BYTES / 1e6
 DEFAULTS = {'tz': 'system', 'statistic': 'Average', 'granularity': '60', 'graph': 'Memory', 'delay': '15',
-            'view': 'tree', 'sort': 'MEM%'}
+            'view': 'tree', 'sort': 'MEM%', 'mouse': 'on'}
 VALID = {'tz': valid_zone, 'statistic': lambda v: v in STATISTICS,
          'granularity': lambda v: v.isdigit() and int(v) in ZOOM_LEVELS, 'graph': lambda v: v in METRICS,
          'delay': lambda v: v.isdigit() and int(v) > 0, 'view': lambda v: v in ('tree', 'list'),
-         'sort': lambda v: v in SORT_COLUMNS}
+         'sort': lambda v: v in SORT_COLUMNS, 'mouse': lambda v: v in ('on', 'off')}
 
 
 def load_settings():
@@ -1010,7 +1010,8 @@ class Viewer:
     """htop for the past: meters and a graph for the column under the marker, and its apps and processes below."""
 
     def __init__(self, screen, store, settings, sampler=None, use_color=True, unicode=True, filter_text='', mouse=True):
-        self.screen, self.store, self.sampler, self.mouse = screen, store, sampler, mouse
+        self.screen, self.store, self.sampler = screen, store, sampler
+        self.mouse, self.mouse_on = mouse, settings.get('mouse', 'on') == 'on'  # -M turns it off for this run only
         self.regions, self.row_top, self.tree_x = [], 0, 0  # clickable areas of the last frame
         self.glyphs = GLYPHS if unicode else ASCII_GLYPHS
         self.styles = self.make_styles(use_color and curses.has_colors())
@@ -1056,7 +1057,17 @@ class Viewer:
 
     def settings(self):
         return {'tz': self.tz, 'statistic': self.statistic, 'granularity': str(self.zoom), 'graph': self.metric,
-                'delay': str(self.delay), 'view': 'tree' if self.tree else 'list', 'sort': self.sort_key}
+                'delay': str(self.delay), 'view': 'tree' if self.tree else 'list', 'sort': self.sort_key,
+                'mouse': 'on' if self.mouse_on else 'off'}
+
+    def apply_mouse(self):
+        """Mouse on: clicks go to hmon, and holding Shift (Option in iTerm2) lets the terminal select text instead.
+        Mouse off: dragging selects text."""
+        try:
+            curses.mousemask(curses.ALL_MOUSE_EVENTS if self.mouse and self.mouse_on else 0)
+            curses.mouseinterval(0)  # report presses at once instead of waiting to tell clicks from double-clicks
+        except curses.error:
+            pass
 
     def apply_tz(self, name):
         if name == 'system':
@@ -1379,7 +1390,20 @@ class Viewer:
             pass  # the release of the click that opened help, or a press: wait for a whole click or a key
         self.blocking(False)
 
-    SETTINGS = ['Time zone', 'Statistic', 'Granularity', 'Graph', 'Refresh delay', 'View', 'Sample every', 'Keep']
+    SETTINGS = ['Time zone', 'Statistic', 'Granularity', 'Graph', 'Refresh delay', 'View', 'Mouse', 'Sample every',
+                'Keep']
+    RECORDING = SETTINGS.index('Sample every')  # where Setup's Recording section starts
+
+    @classmethod
+    def setting_row(cls, i):
+        """The screen row of setting i in Setup; the Recording section has a heading above it."""
+        return 4 + i + (1 if i >= cls.RECORDING else 0)
+
+    def mouse_text(self, value):
+        if not self.mouse:
+            return f'{value}   (off for this run: -M)'
+        return f'{value}   ' + ('hold Shift (Option in iTerm2) to select text' if value == 'on'
+                                else 'dragging selects text; keys still work')
 
     def setting_options(self, name):
         """(options, current, name of an option, how its row in the dropdown reads) for one setting."""
@@ -1398,6 +1422,8 @@ class Viewer:
             return DELAYS, self.delay, lambda d: f'{d / 10:g} s', lambda d: f'{d / 10:g} s between live samples'
         if name == 'View':
             return ['tree', 'list'], 'tree' if self.tree else 'list', str, str
+        if name == 'Mouse':
+            return ['on', 'off'], 'on' if self.mouse_on else 'off', str, self.mouse_text
         interval, days = self.recording
         if interval is None:
             return [], None, str, str
@@ -1413,6 +1439,8 @@ class Viewer:
             return 'the hmon service is not installed here'
         if name == 'Time zone':
             return f'{self.tz}   ({zone_offset(self.tz)})'
+        if name == 'Mouse':
+            return self.mouse_text(current)
         if name == 'Sample every':
             return f'{short(current)}   about {megabytes_per_day(current, self.process_count):,.0f} MB a day'
         if name == 'Keep':
@@ -1433,6 +1461,9 @@ class Viewer:
             self.delay = value
         elif name == 'View':
             self.tree = value == 'tree'
+        elif name == 'Mouse':
+            self.mouse_on = value == 'on'
+            self.apply_mouse()
         elif name == 'Sample every':
             self.recording[0] = value
         else:
@@ -1504,13 +1535,12 @@ class Viewer:
             self.put(2, 2, 'Up/Down choose a setting. Enter or a click opens its list (type to filter); Left/Right '
                            'steps through it.', 'shadow')
             for i, name in enumerate(names):
-                if i == 6:
+                if i == self.RECORDING:
                     self.put(4 + i, 2, 'Recording (what the installer asked; changing it restarts the hmon service)',
                              'shadow')
-                row = 4 + i + (1 if i >= 6 else 0)
-                self.put(row, 1, f'  {name:<16}{self.setting_text(name)}'.ljust(72),
+                self.put(self.setting_row(i), 1, f'  {name:<16}{self.setting_text(name)}'.ljust(72),
                          'selected' if i == choice else 'normal')
-            self.put(6 + len(names), 2, f'Saved to {CONFIG_PATH} when you leave this screen.', 'shadow')
+            self.put(self.setting_row(len(names)) + 1, 2, f'Saved to {CONFIG_PATH} when you leave this screen.', 'shadow')
             self.put(height - 1, 0, ' ' * (width - 1), 'label')
             self.put_segments(height - 1, 0, [('Enter', 'key'), ('Pick  ', 'label'), ('Esc', 'key'), ('Done  ', 'label')])
 
@@ -1534,8 +1564,8 @@ class Viewer:
                 event = self.mouse_event()
                 if event:
                     click_x, click_y = event[0], event[1]
-                    row = click_y - 4 - (1 if click_y >= 11 else 0)
-                    if 0 <= row < len(names) and click_y != 10:  # a setting: select it, then open its list
+                    row = next((i for i in range(len(names)) if self.setting_row(i) == click_y), None)
+                    if row is not None:  # a setting: select it, then open its list
                         pick, choice = row == choice, row
                     elif click_y == height - 1:
                         if click_x >= len('EnterPick  '):
@@ -1546,8 +1576,8 @@ class Viewer:
             if pick:
                 options, current, short, describe = self.setting_options(names[choice])
                 if options:
-                    row = 4 + choice + (1 if choice >= 6 else 0)
-                    value = self.choose(row + 1, 18, names[choice], options, current, short, describe, draw)
+                    value = self.choose(self.setting_row(choice) + 1, 18, names[choice], options, current, short,
+                                        describe, draw)
                     if value is not None:
                         self.apply_setting(names[choice], value)
         notices = []
@@ -1833,12 +1863,7 @@ class Viewer:
     def run(self):
         self.show_cursor(0)
         self.blocking(False)
-        if self.mouse:
-            try:
-                curses.mousemask(curses.ALL_MOUSE_EVENTS)
-                curses.mouseinterval(0)  # report presses at once instead of waiting to tell clicks from double-clicks
-            except curses.error:
-                pass
+        self.apply_mouse()
         self.tick()
         while True:
             self.draw()

@@ -1,3 +1,10 @@
+What's new in version 0.2.2
+
+* Installer: an update keeps the sampling interval and retention already set instead of asking again
+* Installer: prints each step, and no longer waits on journald where the journal is kept in memory (Storage=volatile);
+  the journal flush, tmpfiles and service restart have time limits, the download retries
+* Setup: a Mouse setting (on/off, saved) for selecting text by dragging; with it on, Shift+drag still selects
+
 What's new in version 0.2.1
 
 * Clicks act on release, as in htop, so Help, Setup and the sort panel no longer close when the button is let go

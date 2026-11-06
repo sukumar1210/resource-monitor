@@ -1,7 +1,8 @@
 #!/bin/bash
 # Installs hmon on a systemd-based Linux host: a record of host, app, container and process usage that survives
-# reboots, plus a persistent kernel log and Docker exit events for explaining crashes. It asks how often to sample
-# and how many days to keep, showing the disk that takes; INTERVAL and RETENTION_DAYS answer without asking.
+# reboots, plus a persistent kernel log and Docker exit events for explaining crashes. A new install asks how often
+# to sample and how many days to keep, showing the disk that takes; an update keeps the earlier answers, and
+# INTERVAL and RETENTION_DAYS answer without asking.
 #
 #   curl -fsSL https://github.com/sukumar1210/resource-monitor/releases/latest/download/install.sh | sudo bash
 #   sudo ./install.sh                                   the same from a clone; installs the hmon.py next to it
@@ -43,9 +44,17 @@ mb_per_day() {  # mb_per_day SECONDS: ~150 bytes per process per sample
     echo $(( 86400 / $1 * processes * 150 / 1000000 ))
 }
 
-# How often to sample and how long to keep it; an update offers the earlier install's answers
+step() {  # step MESSAGE: what the installer is doing now, so a slow step shows where it is
+    echo "==> $*"
+}
+
+# How often to sample and how long to keep it. An update keeps the earlier answers; only a new install asks.
 previous_interval=$(sed -n 's|^Environment=HMON_INTERVAL=\([0-9][0-9]*\)$|\1|p' /etc/systemd/system/hmon.service 2>/dev/null || true)
 previous_days=$(sed -n 's|^d /var/lib/hmon .* \([0-9][0-9]*\)d$|\1|p' /etc/tmpfiles.d/hmon.conf 2>/dev/null || true)
+if [ -n "$previous_interval" ] && [ -n "$previous_days" ]; then
+    INTERVAL=${INTERVAL:-$previous_interval}
+    RETENTION_DAYS=${RETENTION_DAYS:-$previous_days}
+fi
 processes=$(awk '$2 > 0' /proc/[0-9]*/statm 2>/dev/null | wc -l)
 if [ -z "${INTERVAL:-}" ] || [ -z "${RETENTION_DAYS:-}" ]; then
     echo "hmon records every process. This host runs about $processes, so one day of samples takes about:"
@@ -61,16 +70,26 @@ for answer in "$INTERVAL" "$RETENTION_DAYS"; do
         ''|*[!0-9]*|0) echo "Expected a whole number above 0, got '$answer'"; exit 1 ;;
     esac
 done
-echo "Sampling every ${INTERVAL} s and keeping ${RETENTION_DAYS} days: about $(( $(mb_per_day "$INTERVAL") * RETENTION_DAYS )) MB on disk."
+echo "Recording every ${INTERVAL} s and keeping ${RETENTION_DAYS} days: about $(( $(mb_per_day "$INTERVAL") * RETENTION_DAYS )) MB on disk."
+echo "Change it any time in hmon's F2 Setup, or with: sudo hmon configure --interval SECONDS --retention DAYS"
 
-# Persistent journal, so kernel OOM reports and container events survive a reboot
+# Persistent journal, so kernel OOM reports and container events survive a reboot. Where journald keeps its log in
+# memory on purpose (Storage=volatile, as log2ram setups do), it never confirms a flush, so don't wait for one.
+step "Making the journal persistent"
 mkdir -p /etc/systemd/journald.conf.d /var/log/journal
 printf '[Journal]\nSyncIntervalSec=30s\n' > /etc/systemd/journald.conf.d/hmon.conf
-systemd-tmpfiles --create --prefix /var/log/journal
-journalctl --flush
+journal_storage=$({ systemd-analyze cat-config systemd/journald.conf 2>/dev/null || true; } \
+    | sed -n 's/^[[:space:]]*Storage[[:space:]]*=[[:space:]]*\([a-z]*\).*/\1/p' | tail -n 1)
+if [ "$journal_storage" = volatile ] || [ "$journal_storage" = none ]; then
+    echo "    journald is set to Storage=$journal_storage, so the kernel log won't survive a reboot; hmon's samples will."
+else
+    timeout 60 systemd-tmpfiles --create --prefix /var/log/journal || echo "    systemd-tmpfiles took too long; skipped"
+    timeout 15 journalctl --flush || echo "    journald didn't confirm moving its log to disk; it will after the next reboot"
+fi
 
 # The collector; systemd-tmpfiles creates the data directory and deletes files older than RETENTION_DAYS
 if [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "$(dirname "${BASH_SOURCE[0]}")/hmon.py" ]; then
+    step "Installing hmon.py from $(dirname "${BASH_SOURCE[0]}")"
     install -m 755 "$(dirname "${BASH_SOURCE[0]}")/hmon.py" /usr/local/bin/hmon
 else  # piped from curl
     if [ "$VERSION" = dev ]; then
@@ -78,11 +97,13 @@ else  # piped from curl
     else
         url="https://github.com/$REPO/releases/download/$VERSION/hmon.py"
     fi
+    step "Downloading $url"
     download=$(mktemp)
-    curl -fsSL "$url" -o "$download"
+    curl -fsSL --retry 3 --connect-timeout 15 --max-time 120 "$url" -o "$download"
     install -m 755 "$download" /usr/local/bin/hmon
     rm -f "$download"
 fi
+step "Setting up /var/lib/hmon and the services"
 # Like htop: everyone sees what /proc shows them. Where /proc hides other users' processes (hidepid), so does hmon.
 if awk '$2 == "/proc" && $4 ~ /hidepid=(1|2|noaccess|invisible)/ { found = 1 } END { exit !found }' /proc/mounts; then
     data_mode=0700
@@ -128,9 +149,10 @@ EOF
     units+=(hmon-events)
 fi
 
+step "Starting ${units[*]}"
 systemctl daemon-reload
-systemctl enable "${units[@]}"
-systemctl restart "${units[@]}"
+systemctl enable --quiet "${units[@]}"
+timeout 90 systemctl restart "${units[@]}" || echo "    the restart is taking long; see: systemctl status ${units[*]}"
 for unit in "${units[@]}"; do
     echo "$unit: $(systemctl is-active "$unit" || true)"
 done
