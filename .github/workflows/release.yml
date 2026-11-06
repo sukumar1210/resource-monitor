@@ -1,0 +1,40 @@
+# Tests every push and pull request; a pushed tag like v0.1.0 also publishes a GitHub release with
+# install.sh and hmon.py, stamped with this repository and the version.
+name: release
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ['3.7', '3.13']  # oldest supported, and current
+    container: python:${{ matrix.python }}-slim
+    steps:
+      - uses: actions/checkout@v4
+      - run: python -m unittest -v
+      - run: bash -n install.sh
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Stamp repository and version
+        run: |
+          sed -i "s|^REPO=.*|REPO=\${HMON_REPO:-$GITHUB_REPOSITORY}|; s|^VERSION=dev$|VERSION=$GITHUB_REF_NAME|" install.sh
+          sed -i "s|^VERSION = 'dev'|VERSION = '${GITHUB_REF_NAME#v}'|" hmon.py
+          grep -n '^REPO=\|^VERSION=' install.sh
+          grep -n '^VERSION = ' hmon.py
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" install.sh hmon.py --title "$GITHUB_REF_NAME" --generate-notes
