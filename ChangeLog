@@ -1,3 +1,11 @@
+What's new in version 0.2.1
+
+* Clicks act on release, as in htop, so Help, Setup and the sort panel no longer close when the button is let go
+* Setup opens a dropdown for every setting (type to filter); time zones come from the system's zone database
+* Setup's Recording section, and `hmon configure`, change the sampling interval and retention the installer asked
+* `+` always unfolds and `-` always folds; Enter still toggles
+* Function bar: a space after full-width labels (F3Search F4Filter)
+
 What's new in version 0.2.0
 
 * Look and keys of htop: meters, colors, column titles with the sort arrow, function bar, F1 help, F3 search,

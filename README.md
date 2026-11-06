@@ -85,19 +85,25 @@ often to sample and how many days to keep. Finer samples cost more disk; the vie
 | `s` | statistic |
 | Tab | graph memory, CPU, load or swap |
 | Up / Down, PgUp / PgDn, Home / End | select a row |
-| `+` `-` Enter, `*` | fold or unfold the selected app or container, everything |
+| `+` / `-`, Enter, `*` | unfold / fold the selected app or container, toggle it, toggle everything |
 | F3 `/`, F4 `\` | search, filter (case-insensitive; `\|` separates terms) |
 | F5 `t` | tree or list view |
 | F6 `<` `>`, `M` `P` `N`, `I` | sort column, sort by MEM% / CPU% / PID, reverse |
-| F2 | setup: time zone, statistic, granularity, graph, refresh delay, view |
+| F2 | setup: time zone, statistic, granularity, graph, refresh delay, view, and the recording |
 | F1 `h` `?`, F10 `q` | help, quit |
 
-The mouse works as in htop: click a row, a fold marker, a column title (again to reverse), a graph tab, a point on
-the graph, or a function-bar item; the wheel scrolls the table, or moves through time over the graph. `-M` turns it
-off.
+The mouse works as in htop, acting when the button is released: click a row, a fold marker, a column title (again to
+reverse), a graph tab, a point on the graph, or a function-bar item; the wheel scrolls the table, or moves through
+time over the graph. `-M` turns it off.
 
-**Time zone.** Times show in the host's zone. Change it in F2 Setup (Left/Right cycles common zones, Enter types any:
-`Asia/Kolkata`, `UTC`, `IST`, `+05:30`), with `--tz`, or with `TZ`. Settings are saved to `~/.config/hmon/hmonrc`.
+**Setup (F2).** Enter or a click opens a setting's dropdown, where typing filters the list (`kolk` finds
+`Asia/Kolkata` among the system's time zones, each shown with its UTC offset); Left/Right steps through the choices.
+Settings are saved to `~/.config/hmon/hmonrc`; `--tz` or `TZ` override the time zone for one run.
+
+The **Recording** section holds what the installer asked: how often to sample and how many days to keep, with the
+disk each choice takes on this host. Changing them rewrites the hmon service and restarts it, so under `sudo hmon` it
+applies when you leave Setup; otherwise Setup shows the command, which also works on its own:
+`sudo hmon configure --interval 10 --retention 3` (`hmon configure` alone prints the current values).
 
 Options, as in htop: `-C` monochrome (also `NO_COLOR`), `-U` ASCII only, `-F FILTER`, `-s COLUMN`, `-d DELAY`
 (tenths of a second for the live refresh), `-M` no mouse, `-V` version.

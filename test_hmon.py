@@ -140,7 +140,8 @@ class EndToEnd(unittest.TestCase):
             with self.assertRaises(Stop):
                 hmon.main(['collect'])
 
-        frames = browse(data_dir, [ord('/')] + [ord(c) for c in 'docker'] + [10, ord('+'), hmon.curses.KEY_F5])
+        keys = [ord('/')] + [ord(c) for c in 'docker'] + [10, ord('+'), ord('+'), ord('-'), hmon.curses.KEY_F5]
+        frames = browse(data_dir, keys)
         folded = frames[0]
         for app in ('+ claude', '+ docker', '+ market-recorder', '+ ssh', '+ sessions', '+ systemd'):
             self.assertIn(app, folded)
@@ -149,7 +150,9 @@ class EndToEnd(unittest.TestCase):
         unfolded = frames[9]
         self.assertIn('/usr/bin/dockerd -H fd://', unfolded)
         self.assertRegex(unfolded, r'[├└]\+ openalgo')  # the container sits under docker, folded itself
-        listed = frames[10]
+        self.assertIn('/usr/bin/dockerd -H fd://', frames[10])  # + again keeps it unfolded
+        self.assertNotIn('/usr/bin/dockerd -H fd://', frames[11])  # - folds
+        listed = frames[12]
         self.assertIn('docker/openalgo', listed)
         self.assertIn('postgres://app:***@db/app', listed)  # stored with the password masked
         self.assertNotIn('hunter2', listed)
@@ -182,11 +185,11 @@ class EndToEnd(unittest.TestCase):
                 return hmon.to_second(ts), [ts, 30.0, 1.0, 8 * GiB, 4 * GiB, 0, 1, 1, 0], [
                     [ts, 900, '', 'probe', 50 * MiB, 2.0, 'probe --live', 1, '/system.slice/probe.service']]
 
-        header_click = (0, 10, 19, 0, hmon.curses.BUTTON1_PRESSED)  # the RES title of the table header
+        header_click = (0, 10, 19, 0, hmon.curses.BUTTON1_RELEASED)  # the RES title of the table header
         keys = ([ord('g'), ord('['), ord('['), ord('s'), ord('\t'), ord('\t'), ord('\\')] + [ord(c) for c in 'leak']
-                + [10, ord('\\'), 27, hmon.curses.KEY_MOUSE, hmon.curses.KEY_F2, 10, 27])
-        frames = browse(data_dir, keys, typed=['6/11/2026 08:44 IST', 'Asia/Kolkata'], sampler=Live(),
-                        clicks=[header_click])
+                + [10, ord('\\'), 27, hmon.curses.KEY_MOUSE, hmon.curses.KEY_F2, 10] + [ord(c) for c in 'kolk']
+                + [10, 27])
+        frames = browse(data_dir, keys, typed=['6/11/2026 08:44 IST'], sampler=Live(), clicks=[header_click])
 
         self.assertIn('live', frames[0].split('\n')[2])  # the newest column is the live sample
         self.assertIn('+ probe', frames[0])
@@ -203,9 +206,55 @@ class EndToEnd(unittest.TestCase):
         self.assertNotIn('openalgo', filtered)
         self.assertIn('+ docker', frames[14])  # Esc in the filter bar clears it; apps are folded again
         self.assertIn('RES▽', frames[15])  # a click on a column title sorts by it
-        self.assertIn('times in IST', frames[18])
+        self.assertIn('F3Search F4Filter', frames[15])  # full-width labels keep a space before the next key
+        self.assertIn('Time zone (type to filter)', frames[17].replace('   ', ' '))  # Enter opens a dropdown
+        zones = frames[21]
+        self.assertIn('Time zone: kolk', zones)
+        self.assertRegex(zones, r'Asia/Kolkata\s+UTC\+05:30')
+        self.assertIn('times in IST', frames[23])
         with open(hmon.CONFIG_PATH) as f:
             self.assertIn('tz=Asia/Kolkata', f.read())
+
+    def test_mouse_clicks_act_on_release(self):
+        data_dir = self.history()
+        f1 = (1, 45)  # F1 Help on the function bar
+        clicks = [(0, *f1, 0, hmon.curses.BUTTON1_PRESSED), (0, *f1, 0, hmon.curses.BUTTON1_RELEASED),
+                  (0, 5, 5, 0, hmon.curses.BUTTON1_PRESSED)]
+        frames = browse(data_dir, [hmon.curses.KEY_MOUSE] * 3 + [ord('x')], clicks=clicks)
+        self.assertNotIn('Press any key or click to return.', frames[1])  # the press alone does nothing
+        self.assertIn('Press any key or click to return.', frames[2])  # the release opens help
+        self.assertIn('Press any key or click to return.', frames[3])  # and a stray press doesn't close it
+        self.assertNotIn('Press any key or click to return.', frames[4])
+
+    def test_setup_changes_what_the_installer_asked(self):
+        data_dir = self.history()
+        unit, rule = os.path.join(self.dir.name, 'hmon.service'), os.path.join(self.dir.name, 'hmon.conf')
+        with open(unit, 'w') as f:
+            f.write('[Unit]\nDescription=hmon\n\n[Service]\nEnvironment=HMON_INTERVAL=60\n'
+                    'ExecStart=/usr/local/bin/hmon collect\n')
+        with open(rule, 'w') as f:
+            f.write('d /var/lib/hmon 0755 root root 14d\n')
+        down, keys = hmon.curses.KEY_DOWN, hmon.curses.KEY_F2
+        keys = [keys] + [down] * 6 + [hmon.curses.KEY_LEFT, down, 10, ord('7'), 10, 27]
+        with mock.patch.object(hmon, 'UNIT_PATH', unit), mock.patch.object(hmon, 'TMPFILES_PATH', rule), \
+                mock.patch.object(hmon.os, 'geteuid', return_value=0), \
+                mock.patch.object(hmon.subprocess, 'run') as run:
+            frames = browse(data_dir, keys)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                hmon.main(['configure'])
+        self.assertIn('what the installer asked', frames[1])
+        self.assertRegex(frames[1], r'Sample every\s+60 s\s+about [\d,]+ MB a day')
+        self.assertRegex(frames[1], r'Keep\s+14 days\s+about [\d,]+ MB in all')
+        self.assertRegex(frames[8], r'Sample every\s+30 s')  # Left steps through the choices
+        self.assertRegex(frames[11], r'7 days\s+about [\d,]+ MB in all')  # the retention dropdown, filtered
+        self.assertIn('Recording every 30 s, kept 7 days; the hmon service restarted.', frames[13])
+        with open(unit) as f:
+            self.assertIn('Environment=HMON_INTERVAL=30\n', f.read())
+        with open(rule) as f:
+            self.assertEqual(f.read(), 'd /var/lib/hmon 0755 root root 7d\n')
+        run.assert_any_call(['systemctl', 'restart', 'hmon'], check=True)
+        self.assertIn('Recording every 30 s, kept 7 days.', out.getvalue())
 
     def test_export_a_dump_and_query_it(self):
         data_dir = self.history()

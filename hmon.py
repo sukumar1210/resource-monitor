@@ -895,9 +895,81 @@ def header_segments(widths, sort_key, descending, tree_mode, glyphs):
 
 # ---------------------------------------------------------------- settings (F2), saved like htop's htoprc
 
-TZ_PRESETS = ['system', 'UTC', 'Asia/Kolkata', 'Asia/Singapore', 'Asia/Tokyo', 'Australia/Sydney', 'Europe/London',
-              'Europe/Berlin', 'America/New_York', 'America/Chicago', 'America/Los_Angeles']
 DELAYS = [5, 10, 15, 20, 30, 50, 100]  # live refresh, tenths of a second
+# What the installer asks, kept in the service's unit and tmpfiles rule; Setup and `hmon configure` change them.
+UNIT_PATH = '/etc/systemd/system/hmon.service'
+TMPFILES_PATH = '/etc/tmpfiles.d/hmon.conf'
+INTERVALS = [5, 10, 15, 30, 60, 120, 300, 600]  # seconds between samples
+RETENTIONS = [1, 2, 3, 7, 14, 30, 60, 90, 180, 365]  # days kept
+SAMPLE_BYTES = 150  # on disk per process per sample, as the installer estimates
+
+
+def time_zones():
+    """'system', 'UTC' and every zone in the system's zone database, for the time zone dropdown."""
+    zones = set()
+    for folder in ZONEINFO_DIRS:
+        for table in ('zone1970.tab', 'zone.tab'):
+            zones.update(line.split('\t')[2] for line in read_text(os.path.join(folder, table)).splitlines()
+                         if not line.startswith('#') and line.count('\t') >= 2)
+        if zones:
+            break
+    return ['system', 'UTC'] + sorted(zones)
+
+
+def set_zone(name):
+    """Make `name` (or the system's zone) the process's time zone."""
+    if name == 'system':
+        if SYSTEM_TZ is None:
+            os.environ.pop('TZ', None)
+        else:
+            os.environ['TZ'] = SYSTEM_TZ
+    else:
+        os.environ['TZ'] = posix_zone(name)
+    time.tzset()
+
+
+@lru_cache(maxsize=None)
+def zone_offset(name):
+    """'UTC+05:30' for a zone, as of now."""
+    saved = os.environ.get('TZ')
+    set_zone(name)
+    offset = time.localtime().tm_gmtoff
+    if saved is None:
+        os.environ.pop('TZ', None)
+    else:
+        os.environ['TZ'] = saved
+    time.tzset()
+    return f'UTC{"+" if offset >= 0 else "-"}{abs(offset) // 3600:02d}:{abs(offset) % 3600 // 60:02d}'
+
+
+def recording():
+    """(seconds between samples, days kept) of the installed service, or (None, None) where it isn't installed."""
+    unit = read_text(UNIT_PATH)
+    if not unit:
+        return None, None
+    interval = re.search(r'^Environment=HMON_INTERVAL=(\d+)$', unit, re.M)
+    days = re.search(r' (\d+)d$', read_text(TMPFILES_PATH).strip())
+    return int(interval.group(1)) if interval else 60, int(days.group(1)) if days else 14
+
+
+def configure_recording(interval, days):
+    """Rewrites the service's sampling interval and the retention, then restarts the collector. Needs root."""
+    unit = read_text(UNIT_PATH)
+    if re.search(r'^Environment=HMON_INTERVAL=', unit, re.M):
+        unit = re.sub(r'^Environment=HMON_INTERVAL=\d+$', f'Environment=HMON_INTERVAL={interval}', unit, flags=re.M)
+    else:
+        unit = unit.replace('[Service]\n', f'[Service]\nEnvironment=HMON_INTERVAL={interval}\n', 1)
+    rule = re.sub(r' \d+d$', f' {days}d', read_text(TMPFILES_PATH).strip()) + '\n'  # read before opening to write
+    with open(UNIT_PATH, 'w') as f:
+        f.write(unit)
+    with open(TMPFILES_PATH, 'w') as f:
+        f.write(rule)
+    subprocess.run(['systemctl', 'daemon-reload'], check=True)
+    subprocess.run(['systemctl', 'restart', 'hmon'], check=True)
+
+
+def megabytes_per_day(interval, processes):
+    return 86400 / interval * processes * SAMPLE_BYTES / 1e6
 DEFAULTS = {'tz': 'system', 'statistic': 'Average', 'granularity': '60', 'graph': 'Memory', 'delay': '15',
             'view': 'tree', 'sort': 'MEM%'}
 VALID = {'tz': valid_zone, 'statistic': lambda v: v in STATISTICS,
@@ -1234,6 +1306,7 @@ class Viewer:
             return
         x = 0
         for key, name, code in items:
+            name = name if name.endswith(' ') else name + ' '  # a full 6-letter label shouldn't run into the next key
             end = self.put_segments(y, x, [(key, 'key'), (name, 'label')])
             if code is not None:
                 self.regions.append((y, y, x, end, lambda cx, cy, c=code: self.press(c)))
@@ -1288,9 +1361,10 @@ class Viewer:
         left = [(g['left_right'], 'move the marker one column'), ('S-' + g['left_right'], 'move a screen width'),
                 ('^ ^A', 'oldest sample'), ('$ ^E', 'newest sample (live)'), ('g', 'go to 12/10/2026 14:30 IST'),
                 ('[ ]', 'coarser / finer: 10 s .. 1 day'), ('s', 'statistic: avg max min p50/90/99'),
-                ('Tab', 'graph: memory, CPU, load, swap'), ('F2', 'setup: time zone and defaults')]
+                ('Tab', 'graph: memory, CPU, load, swap'), ('F2', 'setup: zone, defaults, recording')]
         right = [(g['up_down'], 'select a row'), ('PgUp PgDn', 'page through the rows'), ('Home End', 'first / last row'),
-                 ('+ - Enter', 'fold / unfold the selected app'), ('* c', 'fold / unfold everything'),
+                 ('+ -', 'unfold / fold the selected app'), ('Enter', 'unfold or fold it'),
+                 ('* c', 'fold / unfold everything'),
                  ('F3 /', 'search'), ('F4 \\', 'filter (\'|\' separates terms)'), ('F5 t', 'tree / list view'),
                  ('F6 < >', 'choose the sort column'), ('M P N', 'sort by MEM% / CPU% / PID'),
                  ('I', 'invert the sort order'), ('F1 h ?', 'this help'), ('F10 q', 'quit')]
@@ -1299,88 +1373,201 @@ class Viewer:
                 self.put(6 + i, x, f'{key:>9}: ', 'value')
                 self.put(6 + i, x + 11, text, 'normal')
         height = self.screen.getmaxyx()[0]
-        self.put(height - 1, 1, 'Press any key to return.', 'normal')
+        self.put(height - 1, 1, 'Press any key or click to return.', 'normal')
         self.screen.refresh()
-        self.screen.getch()
+        while self.screen.getch() == curses.KEY_MOUSE and not self.mouse_event():
+            pass  # the release of the click that opened help, or a press: wait for a whole click or a key
         self.blocking(False)
 
-    def setting_text(self, name):
-        if name == 'Time zone':
-            return f'{self.tz}   ({label(time.time(), "%Z, UTC%z")})'
-        if name == 'Statistic':
-            return self.statistic
-        if name == 'Granularity':
-            return f'{ZOOM_NAMES[self.zoom]} per column'
-        if name == 'Graph':
-            return self.metric
-        if name == 'Refresh delay':
-            return f'{self.delay / 10:g} s (live samples)'
-        return 'tree (apps and containers)' if self.tree else 'list'
+    SETTINGS = ['Time zone', 'Statistic', 'Granularity', 'Graph', 'Refresh delay', 'View', 'Sample every', 'Keep']
 
-    def change_setting(self, name, step):
+    def setting_options(self, name):
+        """(options, current, name of an option, how its row in the dropdown reads) for one setting."""
+        def disk(interval):
+            return megabytes_per_day(interval, self.process_count)
+
         if name == 'Time zone':
-            self.apply_tz(cycle(TZ_PRESETS, self.tz, step))
+            return time_zones(), self.tz, str, lambda z: f'{z:<34}{zone_offset(z)}'
+        if name == 'Statistic':
+            return STATISTICS, self.statistic, str, str
+        if name == 'Granularity':
+            return ZOOM_LEVELS, self.zoom, lambda z: f'{ZOOM_NAMES[z]} per column', lambda z: f'{ZOOM_NAMES[z]} per column'
+        if name == 'Graph':
+            return METRICS, self.metric, str, str
+        if name == 'Refresh delay':
+            return DELAYS, self.delay, lambda d: f'{d / 10:g} s', lambda d: f'{d / 10:g} s between live samples'
+        if name == 'View':
+            return ['tree', 'list'], 'tree' if self.tree else 'list', str, str
+        interval, days = self.recording
+        if interval is None:
+            return [], None, str, str
+        if name == 'Sample every':
+            return (INTERVALS, interval, lambda s: f'{s} s',
+                    lambda s: f'{s} s'.ljust(8) + f'about {disk(s):,.0f} MB a day')
+        return (RETENTIONS, days, lambda d: f'{d} days',
+                lambda d: f'{d} days'.ljust(10) + f'about {disk(interval) * d:,.0f} MB in all')
+
+    def setting_text(self, name):
+        options, current, short, _ = self.setting_options(name)
+        if name in ('Sample every', 'Keep') and current is None:
+            return 'the hmon service is not installed here'
+        if name == 'Time zone':
+            return f'{self.tz}   ({zone_offset(self.tz)})'
+        if name == 'Sample every':
+            return f'{short(current)}   about {megabytes_per_day(current, self.process_count):,.0f} MB a day'
+        if name == 'Keep':
+            interval = self.recording[0]
+            return f'{short(current)}   about {megabytes_per_day(interval, self.process_count) * current:,.0f} MB in all'
+        return short(current)
+
+    def apply_setting(self, name, value):
+        if name == 'Time zone':
+            self.apply_tz(value)
         elif name == 'Statistic':
-            self.statistic = cycle(STATISTICS, self.statistic, step)
+            self.statistic = value
         elif name == 'Granularity':
-            self.set_zoom(step)
+            self.set_zoom(ZOOM_LEVELS.index(value) - ZOOM_LEVELS.index(self.zoom))
         elif name == 'Graph':
-            self.set_metric(cycle(METRICS, self.metric, step))
+            self.set_metric(value)
         elif name == 'Refresh delay':
-            self.delay = cycle(DELAYS, self.delay, step)
+            self.delay = value
+        elif name == 'View':
+            self.tree = value == 'tree'
+        elif name == 'Sample every':
+            self.recording[0] = value
         else:
-            self.tree = not self.tree
+            self.recording[1] = value
+
+    def choose(self, y, x, title, options, current, name=str, describe=str, backdrop=None):
+        """A dropdown at (y, x) over what `backdrop()` draws: arrows, PgUp/PgDn, Home/End or the wheel move, typing
+        filters by name, Enter or a click picks, Esc or a click outside cancels. Returns the pick, or None."""
+        query, index, top = '', options.index(current) if current in options else 0, 0
+        while True:
+            if backdrop:
+                backdrop()  # repainted each time, so a list that shrinks while filtering uncovers the screen
+            height, width = self.screen.getmaxyx()
+            shown = [option for option in options if query.lower() in name(option).lower()]
+            rows = max(1, min(len(shown), height - y - 3))
+            box = min(width - x - 1, max([len(title) + 24] + [len(describe(o)) + 3 for o in shown]))
+            index = min(max(index, 0), max(0, len(shown) - 1))
+            top = max(0, min(max(top, index - rows + 1), index, len(shown) - rows))
+            heading = f' {title}: {query}' if query else f' {title}   (type to filter)'
+            self.put(y, x, heading[:box].ljust(box), 'header')
+            for i in range(rows):
+                text = f' {describe(shown[top + i])}' if top + i < len(shown) else ' no match'
+                self.put(y + 1 + i, x, text[:box].ljust(box), 'selected' if shown and top + i == index else 'normal')
+            self.put(height - 1, 0, ' ' * (width - 1), 'label')
+            self.put_segments(height - 1, 0, [('Enter', 'key'), ('Pick  ', 'label'), ('Esc', 'key'), ('Cancel ', 'label'),
+                                              ('  ', 'key'), ('type to filter', 'label')])
+            self.screen.refresh()
+            key = self.screen.getch()
+            if key in (curses.KEY_UP, curses.KEY_DOWN):
+                index += 1 if key == curses.KEY_DOWN else -1
+            elif key in (curses.KEY_PPAGE, curses.KEY_NPAGE):
+                index += rows if key == curses.KEY_NPAGE else -rows
+            elif key in (curses.KEY_HOME, curses.KEY_END):
+                index = 0 if key == curses.KEY_HOME else len(shown) - 1
+            elif key in (10, 13, curses.KEY_ENTER):
+                return shown[index] if shown else None
+            elif key == 27:
+                return None
+            elif key in (curses.KEY_BACKSPACE, 127, 8):
+                query, index = query[:-1], 0
+            elif 32 <= key < 127:
+                query, index = query + chr(key), 0
+            elif key == curses.KEY_MOUSE:
+                event = self.mouse_event()
+                if not event:
+                    continue
+                click_x, click_y, state = event
+                if self.wheel_step(state):
+                    index += 3 * self.wheel_step(state)
+                elif y < click_y <= y + rows and x <= click_x < x + box:
+                    return shown[top + click_y - y - 1] if top + click_y - y - 1 < len(shown) else None
+                else:
+                    return None
 
     def setup(self):
-        """htop's F2 Setup: Left/Right change a setting, Enter types a time zone; saved to CONFIG_PATH on leaving."""
-        names = ['Time zone', 'Statistic', 'Granularity', 'Graph', 'Refresh delay', 'View']
-        choice, message = 0, ''
+        """htop's F2 Setup. Enter or a click opens a setting's dropdown, Left/Right steps through it. Saved to
+        CONFIG_PATH on leaving; the recording settings (the installer's questions) change the hmon service."""
+        names = self.SETTINGS
+        self.recording = list(recording())
+        installed = tuple(self.recording)
+        self.process_count = max(1, len(self.column(self.cursor).procs))
+        choice = 0
         self.blocking(True)
-        while True:
+
+        def draw():
             height, width = self.screen.getmaxyx()
             self.screen.erase()
             self.put(0, 0, ' Setup'.ljust(width - 1), 'header')
-            self.put(2, 2, 'Up/Down choose, Left/Right change. On Time zone, Enter types one: Asia/Kolkata, UTC, IST, '
-                           '+05:30.', 'shadow')
+            self.put(2, 2, 'Up/Down choose a setting. Enter or a click opens its list (type to filter); Left/Right '
+                           'steps through it.', 'shadow')
             for i, name in enumerate(names):
-                self.put(4 + i, 1, f'  {name:<16}{self.setting_text(name)}'.ljust(64),
+                if i == 6:
+                    self.put(4 + i, 2, 'Recording (what the installer asked; changing it restarts the hmon service)',
+                             'shadow')
+                row = 4 + i + (1 if i >= 6 else 0)
+                self.put(row, 1, f'  {name:<16}{self.setting_text(name)}'.ljust(72),
                          'selected' if i == choice else 'normal')
-            self.put(5 + len(names), 2, message or f'Saved to {CONFIG_PATH} when you leave this screen.', 'shadow')
+            self.put(6 + len(names), 2, f'Saved to {CONFIG_PATH} when you leave this screen.', 'shadow')
             self.put(height - 1, 0, ' ' * (width - 1), 'label')
-            self.put_segments(height - 1, 0, [('Enter', 'key'), ('Edit  ', 'label'), ('Esc', 'key'), ('Done  ', 'label')])
+            self.put_segments(height - 1, 0, [('Enter', 'key'), ('Pick  ', 'label'), ('Esc', 'key'), ('Done  ', 'label')])
+
+        while True:
+            height, width = self.screen.getmaxyx()
+            draw()
             self.screen.refresh()
             key = self.screen.getch()
+            pick = False
             if key == curses.KEY_UP:
                 choice = max(0, choice - 1)
             elif key == curses.KEY_DOWN:
                 choice = min(len(names) - 1, choice + 1)
             elif key in (curses.KEY_LEFT, curses.KEY_RIGHT):
-                self.change_setting(names[choice], 1 if key == curses.KEY_RIGHT else -1)
-                message = ''
+                options, current, _, _ = self.setting_options(names[choice])
+                if options:
+                    self.apply_setting(names[choice], cycle(options, current, 1 if key == curses.KEY_RIGHT else -1))
+            elif key in (10, 13, curses.KEY_ENTER):
+                pick = True
             elif key == curses.KEY_MOUSE:
                 event = self.mouse_event()
-                if event and 4 <= event[1] < 4 + len(names):  # click a setting to select it, again to change it
-                    if event[1] - 4 == choice:
-                        self.change_setting(names[choice], 1)
-                    choice = event[1] - 4
-                elif event and event[1] == height - 1:
-                    if event[0] >= len('EnterEdit  '):
-                        break
-                    key = 10  # the Edit button
-            if key in (10, 13, curses.KEY_ENTER) and names[choice] == 'Time zone':
-                zone = self.ask(4 + choice, '  Time zone:      ')
-                self.blocking(True)
-                if zone and valid_zone(zone):
-                    self.apply_tz(zone)
-                elif zone:
-                    message = f'Unknown time zone "{zone}"; try Asia/Kolkata, UTC, IST or +05:30.'
+                if event:
+                    click_x, click_y = event[0], event[1]
+                    row = click_y - 4 - (1 if click_y >= 11 else 0)
+                    if 0 <= row < len(names) and click_y != 10:  # a setting: select it, then open its list
+                        pick, choice = row == choice, row
+                    elif click_y == height - 1:
+                        if click_x >= len('EnterPick  '):
+                            break
+                        pick = True
             elif key in (27, ord('q'), curses.KEY_F2, curses.KEY_F10):
                 break
+            if pick:
+                options, current, short, describe = self.setting_options(names[choice])
+                if options:
+                    row = 4 + choice + (1 if choice >= 6 else 0)
+                    value = self.choose(row + 1, 18, names[choice], options, current, short, describe, draw)
+                    if value is not None:
+                        self.apply_setting(names[choice], value)
+        notices = []
+        if self.recording[0] is not None and tuple(self.recording) != installed:
+            interval, days = self.recording
+            if os.geteuid() == 0:
+                try:
+                    configure_recording(interval, days)
+                    notices.append(f'Recording every {interval} s, kept {days} days; the hmon service restarted.')
+                except (OSError, subprocess.CalledProcessError) as error:
+                    notices.append(f'Could not change the recording: {error}.')
+            else:
+                notices.append(f'To record every {interval} s and keep {days} days, run: '
+                               f'sudo hmon configure --interval {interval} --retention {days}')
         try:
             save_settings(self.settings())
-            self.notice = f'Settings saved to {CONFIG_PATH}'
+            notices.append(f'Settings saved to {CONFIG_PATH}.')
         except OSError as error:
-            self.notice = f'Could not save the settings: {error}'
+            notices.append(f'Could not save the settings: {error}.')
+        self.notice = '  '.join(notices)
         self.blocking(False)
 
     def pick_sort(self):
@@ -1403,7 +1590,9 @@ class Viewer:
                 choice = min(len(options) - 1, choice + 1)
             elif key == curses.KEY_MOUSE:
                 event = self.mouse_event()
-                row = event[1] - self.table_top - 1 if event else -1
+                if not event:
+                    continue  # a press, or the release of the click that opened this panel
+                row = event[1] - self.table_top - 1
                 if 0 <= row < len(options):
                     self.set_sort(options[row])
                 break
@@ -1455,14 +1644,21 @@ class Viewer:
         self.index += delta
         self.selected = None
 
-    def toggle_selected(self):
+    def fold(self, unfold=None):
+        """+ unfolds, - folds, Enter toggles the selected row; on a process with nothing under it, - and Enter fold
+        the app or container around it."""
         if not self.tree or not self.rows:
             return
         row = self.rows[self.index]
-        key = row.key if row.has_children else row.group
-        if key:
-            self.toggled ^= {key}
-            self.selected = key
+        if row.has_children:
+            key, is_open = row.key, row.is_open
+        elif row.group and unfold is not True:
+            key, is_open = row.group, True
+        else:
+            return
+        if (not is_open if unfold is None else unfold) != is_open:
+            self.toggled ^= {key}  # toggled holds the rows flipped from their default
+        self.selected = key
 
     def toggle_all(self):
         if self.group_keys & self.toggled:
@@ -1483,12 +1679,21 @@ class Viewer:
     # ---- mouse, as in htop
 
     def mouse_event(self):
-        """(x, y, button state) of the pending mouse event, or None."""
+        """(x, y, button state) of a finished click or a wheel turn, else None. Like htop, a click counts when the
+        button is released, so a dialog opened by a click isn't closed again by that click's release."""
         try:
             _, x, y, _, state = curses.getmouse()
         except curses.error:
             return None
-        return x, y, state
+        wheel = curses.BUTTON4_PRESSED | getattr(curses, 'BUTTON5_PRESSED', 0)  # missing from older ncurses
+        return (x, y, state) if state & (curses.BUTTON1_RELEASED | curses.BUTTON1_CLICKED | wheel) else None
+
+    @staticmethod
+    def wheel_step(state):
+        """-1 for the wheel turned up, 1 for down, 0 for a click."""
+        if state & curses.BUTTON4_PRESSED:
+            return -1
+        return 1 if state & getattr(curses, 'BUTTON5_PRESSED', 0) else 0
 
     def click(self):
         """A click runs whatever was drawn under it; the wheel scrolls the table, or moves in time over the graph.
@@ -1497,18 +1702,16 @@ class Viewer:
         if not event:
             return True
         x, y, state = event
-        wheel_down = getattr(curses, 'BUTTON5_PRESSED', 0)  # missing from older ncurses builds
-        if state & (curses.BUTTON4_PRESSED | wheel_down):
-            step = -1 if state & curses.BUTTON4_PRESSED else 1
+        step = self.wheel_step(state)
+        if step:
             if y >= self.row_top:
                 self.move_selection(3 * step)
             else:
                 self.cursor += step * self.zoom
             return True
-        if state & (curses.BUTTON1_PRESSED | curses.BUTTON1_CLICKED):
-            for y0, y1, x0, x1, action in self.regions:
-                if y0 <= y <= y1 and x0 <= x < x1:
-                    return action(x, y) is not False
+        for y0, y1, x0, x1, action in self.regions:
+            if y0 <= y <= y1 and x0 <= x < x1:
+                return action(x, y) is not False
         return True
 
     def press(self, key):
@@ -1533,7 +1736,7 @@ class Viewer:
         on_marker = self.tree_x <= x < self.tree_x + len(row.tree)
         if row.has_children and (on_marker or index == self.index):
             self.index = index
-            self.toggle_selected()
+            self.fold()
         else:
             self.index, self.selected = index, None
 
@@ -1617,8 +1820,12 @@ class Viewer:
             self.move_selection(-len(self.rows))
         elif key == curses.KEY_END:
             self.move_selection(len(self.rows))
-        elif char in ('+', '-', '=', '\n', '\r') or key == curses.KEY_ENTER:
-            self.toggle_selected()
+        elif char in ('+', '='):
+            self.fold(unfold=True)
+        elif char == '-':
+            self.fold(unfold=False)
+        elif char in ('\n', '\r') or key == curses.KEY_ENTER:
+            self.fold()
         elif char in ('*', 'c'):
             self.toggle_all()
         return True
@@ -1775,6 +1982,7 @@ def main(argv):
               '       %(prog)s [options] at "12/10/2026 14:30 IST" [SOURCE]\n'
               '       %(prog)s [options] export [--from TIME] [--to TIME] [-o FILE.tar.gz | --sqlite FILE.db] [SOURCE]\n'
               '       %(prog)s [options] sql "SELECT ..." [--from TIME] [--to TIME] [SOURCE]\n'
+              '       %(prog)s configure [--interval SECONDS] [--retention DAYS]\n'
               '       %(prog)s collect',
         description=f'hmon {VERSION} - htop for the past: what every app, container and process used, over time, '
                     'recorded by the hmon service and browsed here.',
@@ -1795,6 +2003,8 @@ def main(argv):
     parser.add_argument('--to', dest='end', metavar='TIME', help='export/sql: end (default now)')
     parser.add_argument('-o', '--output', metavar='FILE', help='export: the .tar.gz dump to write')
     parser.add_argument('--sqlite', metavar='FILE', help='export: write a SQLite database instead of a dump')
+    parser.add_argument('--interval', type=int, metavar='SECONDS', help='configure: seconds between samples (root)')
+    parser.add_argument('--retention', type=int, metavar='DAYS', help='configure: days of samples to keep (root)')
     parser.add_argument('words', nargs='*', help=argparse.SUPPRESS)
     args = parser.parse_intermixed_args(argv)  # options may come before or after SOURCE
 
@@ -1831,6 +2041,20 @@ def main(argv):
     words = args.words
     if words == ['collect']:
         collect()
+    elif words == ['configure']:
+        interval, days = recording()
+        if interval is None:
+            sys.exit('The hmon service is not installed here; run the installer first.')
+        if args.interval is None and args.retention is None:
+            print(f'Recording every {interval} s, kept {days} days.')
+            return
+        if any(value is not None and value < 1 for value in (args.interval, args.retention)):
+            parser.error('--interval and --retention take a whole number above 0')
+        if os.geteuid() != 0:
+            sys.exit('Changing the recording rewrites the hmon service; run this with sudo.')
+        configure_recording(args.interval or interval, args.retention or days)
+        print(f'Recording every {args.interval or interval} s, kept {args.retention or days} days; '
+              'the hmon service restarted.')
     elif words[:1] == ['at'] and len(words) in (2, 3):
         show_snapshot(words[1], source(field(words, 2)))
     elif words[:1] == ['export'] and len(words) <= 2:
