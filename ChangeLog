@@ -1,0 +1,18 @@
+What's new in version 0.2.0
+
+* Look and keys of htop: meters, colors, column titles with the sort arrow, function bar, F1 help, F3 search,
+  F4 filter, F5 tree/list, F6 sort, M/P/N/I, mouse
+* Processes grouped into apps (systemd units, containers under docker, programs at the top of a process tree),
+  folded by default, with htop's process tree inside
+* Live: the newest column samples /proc every 1.5 s, and recorded samples are picked up as they land
+* Graph of memory, CPU, load or swap at 10 s to 1 day per column, with Average, Maximum, Minimum, p50, p90, p99
+* F2 Setup for the time zone and defaults, saved to ~/.config/hmon/hmonrc
+* Go to everyday dates and zones: 12/10/2026 14:30 IST, 2 Feb 2025 UTC
+* hmon export (a .tar.gz dump or SQLite), hmon FILE.tar.gz, hmon sql "SELECT ..."
+* Installer asks how often to sample and how long to keep it, with the disk that takes
+* No sudo needed to view, except where /proc hides other users' processes
+* Records each process's parent and cgroup, load 5/15 and swap total; files from 0.1.0 still load
+
+What's new in version 0.1.0
+
+* First release: per-minute host, container and process samples, a time-graph viewer, `hmon at`

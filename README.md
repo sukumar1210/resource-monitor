@@ -1,135 +1,163 @@
 # resource-monitor (`hmon`)
 
-`hmon` records what a Linux host, every Docker container and every process were using, once a minute, and keeps
-it across reboots. When something crashes, open `hmon`, go back to just before it happened, and see what was
-eating memory or CPU.
+`hmon` is htop for the past. A small service records what every app, Docker container and process on a Linux host
+uses, and keeps it across reboots. When something crashes, open `hmon`, go back to just before it happened, and see
+what was eating memory or CPU. The newest column updates live, like htop.
 
 ```
- hmon   [Memory]   CPU    1 min/column   times in UTC
-100%│                                                                                                          ▃▇▇▇▇▇▇▇
-    │                                                                                                        ▄▇████████
-    │                                                                                                     ▁▅███████████
-    │                                                                                              ▁▄██████████████████
-    │██████████████████████████████████████████████████████████████████████████████████████████████████████████████████
- 50%│██████████████████████████████████████████████████████████████████████████████████████████████████████████████████
-    │██████████████████████████████████████████████████████████████████████████████████████████████████████████████████
-  0%└─────────────────────────────────────────────────────────────────────────────────────────────────────────────────▲
-              01:30     01:40     01:50     02:00     02:10     02:20     02:30     02:40     02:50     03:00     03:10
- 2026-11-06 03:14 UTC   memory used 99.2% of 7.63 GiB   cpu 76.2%   load 6.8   swap used 0.00 GiB
+ CPU[|||||||||||||                          20.5%]    Tasks: 27 processes in 13 apps, 2 containers
+ Mem[||||||||||||||||||||||||||       5.58G/11.6G]    Load average: 0.82 0.76 0.68
+ Swp[||||||||||                        300M/2.00G]    Time: 2026-11-06 17:30 IST
 
-    PID    CPU%        MEM   MEM%  COMMAND   (average over the column, by MEM)
-         100.1%   4.80 GiB  62.9%  ▾ web  (container, 12 pids)
-   8123   98.0%   4.48 GiB  58.8%    ├─ python /opt/app/jobs/nightly_report.py
-   2402    1.2%   0.15 GiB   1.9%    ├─ gunicorn app.wsgi -w 2 -b 0.0.0.0:8000
-   2403    0.9%   0.14 GiB   1.9%    └─ gunicorn app.wsgi -w 2 -b 0.0.0.0:8000
-           9.5%   2.23 GiB  29.2%  ▾ db  (container, 4 pids)
-   2210    9.5%   2.20 GiB  28.8%    └─ mongod --bind_ip_all --wiredTigerCacheSizeGB 2
-   1102    0.6%   0.09 GiB   1.2%  /usr/bin/dockerd -H fd:// --containerd=/run/containerd/containerd.sock
-     71   37.2%   0.00 GiB      -  [kswapd0]
- left/right time  g go to  up/down scroll  PgUp/PgDn  Home/End  +/- zoom  Tab mem/cpu  c fold  q quit
+  Memory   CPU   Load   Swap     Average per 1 min, times in IST
+ 100%│                                                                           │
+  50%│▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂▂
+     │█████████████████████████████████████████████████████████████████████████████
+   0%└───────────────────────────────────────────────────────────────────────────▲
+       16:20     16:30     16:40     16:50     17:00     17:10     17:20     17:30
+
+    PID    RES   CPU%  MEM%▽ App / Process
+         1820M    6.2  15.3  + claude    8 processes
+          923M    4.0   7.8  ─ docker    7 processes, 2 containers
+          610M    3.5   5.1  ├+ openalgo    2 processes
+   1092   200M    0.1   1.7  ├─ /usr/bin/dockerd -H fd:// --containerd=/run/containerd/containerd.sock
+ 942434  10240    0.0   0.1  │  └─ /usr/bin/docker-proxy -proto tcp -host-port 5000 -container-port 5000
+         53248    0.3   0.4  ├+ redis    1 process
+    931  40960    0.1   0.3  ├─ /usr/bin/containerd
+ 942377  11264    0.0   0.1  └─ /usr/bin/containerd-shim-runc-v2 -namespace moby -id 7526c2cf3b57
+          330M    0.0   2.8  + market-recorder    1 process
+          180M    0.0   1.5  + actions.runner.homelab    2 processes
+F1Help  F2Setup F3SearchF4FilterF5List  F6SortByF10Quit  ←→Time  []Zoom  sStat  gGoTo  TabGraph
 ```
 
-(An excerpt of the real screen on demo data: a job inside the `web` container grows until the host runs out of
-memory at 03:14, and the kernel's swapper `kswapd0` is busy trying to free memory.)
+(A real screen on demo data, trimmed to fit: `docker` unfolded, its containers folded. Memory figures are htop's:
+`10240` is KiB, `1820M` is MiB.)
 
 ## What it records
 
-- **Host**: CPU %, 1-minute load, memory total / available, swap used.
-- **Docker containers** (if Docker is installed): `docker stats` CPU, memory, memory limit, network, block I/O, pids.
-- **Processes**: every process using memory or CPU, inside or outside containers, with its container, memory (RSS),
-  CPU % over the last minute and command line.
-- **Crash evidence**: the systemd journal is made persistent, so the kernel's OOM-killer reports survive a reboot,
-  and Docker container exits (exit code, OOM, kill signal) are logged to it by the `hmon-events` service.
+- **Host**: CPU %, load average, memory and swap.
+- **Docker containers** (if Docker is installed): `docker stats` CPU, memory, limit, network, block I/O, pids.
+- **Every process** using memory or CPU, with its parent, container and systemd unit, memory (RSS), CPU % and
+  command line.
+- **Crash evidence**: the journal is made persistent, so the kernel's OOM-killer reports survive a reboot, and Docker
+  container exits (exit code, OOM, kill signal) are logged to it by the `hmon-events` service.
 
-Samples are plain CSV in `/var/lib/hmon` (`host_`, `containers_`, `processes_` + UTC date), written and fsynced every
-minute so the last rows before a crash survive it, and deleted after 14 days. Roughly 25 MB a day for 150 processes.
-
-**Privacy.** Command lines can contain credentials, so the data directory is readable by root only, and values that
-look like credentials (`user:password@` in URLs, `password=…`, `token=…`, `--password …`, `--api-key …`) are
-replaced with `***` before they are written. The masking is pattern-based and misses forms such as `mysql -pSECRET`,
-so treat the files as sensitive when you copy them off the host.
+Samples are plain CSV in `/var/lib/hmon`, one file per kind per UTC day, fsynced on every write so the last samples
+before a crash survive it, and deleted after the retention you choose.
 
 ## Install
 
-Needs Linux with systemd and Python 3.7+ (standard library only). Docker is optional.
+Linux with systemd and Python 3.7+ (standard library only). Docker is optional.
 
 ```
 curl -fsSL https://github.com/sukumar1210/resource-monitor/releases/latest/download/install.sh | sudo bash
 ```
 
-This installs the latest release. Other forms:
+The installer shows how much disk a day of samples takes on this host at 10 s, 30 s, 1 min and 5 min, then asks how
+often to sample and how many days to keep. Finer samples cost more disk; the viewer can always zoom out.
 
-- A specific release: `.../releases/download/v0.1.0/install.sh` in place of `.../releases/latest/download/install.sh`.
-- Keep a different number of days (default 14): `... | sudo RETENTION_DAYS=30 bash`
-- Update: run the same command again. It installs the latest release, restarts the service, keeps the recorded data
-  and the retention you chose, and prints the old and new version. Updates are never automatic.
+- No questions: `... | sudo INTERVAL=60 RETENTION_DAYS=14 bash`
+- A specific release: `.../releases/download/v0.2.0/install.sh` in place of `.../releases/latest/download/install.sh`.
+- Update: run the install command again; it offers your earlier answers and keeps the data.
 - Remove: `... | sudo bash -s -- uninstall` (the data in `/var/lib/hmon` is left for you to delete).
-- From a clone: `sudo ./install.sh` installs the `hmon.py` next to it.
-- Without systemd: run `python3 hmon.py collect` from your init system; set `HMON_DATA_DIR` to write elsewhere.
-
-`hmon --version` shows which release is installed.
+- From a clone: `sudo ./install.sh`. Without systemd: run `python3 hmon.py collect` from your init system
+  (`HMON_DATA_DIR` and `HMON_INTERVAL` set where and how often).
 
 ## Use
 
-`sudo hmon` opens the viewer on the newest sample.
+`hmon` opens the viewer, like htop: no sudo needed. Hosts that hide other users' processes (`/proc` mounted with
+`hidepid`) keep the data root-only, as htop needs root there too: `sudo hmon`.
 
-| Key | Action |
+- **Meters** (CPU, Mem, Swp, tasks, load, time) and the **table** show the column under the marker.
+- **The graph** plots memory, CPU, load or swap over time, one column per 10 s, 1 min, 5 min, 15 min, 30 min,
+  1 hour or 1 day, reduced with a CloudWatch-style statistic: Average, Maximum, Minimum, p50, p90 or p99.
+  Apps and containers are totalled per sample before the statistic, so a Maximum is a real peak.
+- **The table groups processes into apps**, folded until you open them: containers sit under `docker`, system
+  services take their systemd unit's name, and anything else is named after the program at the top of its process
+  tree (so every `claude` process is one app). Inside an app, processes nest under their parents as in htop's tree.
+
+| Keys | |
 | --- | --- |
-| Left / Right | move the marker one column back / forward in time |
-| g | go to a time: `2026-11-06 08:44`, or `08:44` on the marker's date |
-| PgUp / PgDn | move a screen width |
-| Home / End | oldest / newest sample |
-| + / - | zoom: 1, 5, 15 or 60 minutes per column (values are averages over the column) |
-| Tab | switch the graph and the table's sort between memory and CPU |
-| Up / Down | scroll the process table |
-| c | fold / unfold containers to one row each |
-| q | quit |
+| Left / Right, Shift+Left / Right | move the marker a column / a screen width |
+| `^` `$` | oldest sample / newest (live) |
+| `g` | go to a time: `12/10/2026 14:30 IST`, `2 Feb 2025 UTC`, `Oct 12 2026 2:30 pm`, `14:30` (dates are day first) |
+| `[` `]` | coarser / finer columns |
+| `s` | statistic |
+| Tab | graph memory, CPU, load or swap |
+| Up / Down, PgUp / PgDn, Home / End | select a row |
+| `+` `-` Enter, `*` | fold or unfold the selected app or container, everything |
+| F3 `/`, F4 `\` | search, filter (case-insensitive; `\|` separates terms) |
+| F5 `t` | tree or list view |
+| F6 `<` `>`, `M` `P` `N`, `I` | sort column, sort by MEM% / CPU% / PID, reverse |
+| F2 | setup: time zone, statistic, granularity, graph, refresh delay, view |
+| F1 `h` `?`, F10 `q` | help, quit |
 
-The table shows averages for the column under the marker: processes outside containers on their own rows, and each
-container as a group (its `docker stats` totals) with its processes under it. CPU % is per core, like `top`.
+The mouse works as in htop: click a row, a fold marker, a column title (again to reverse), a graph tab, a point on
+the graph, or a function-bar item; the wheel scrolls the table, or moves through time over the graph. `-M` turns it
+off.
 
-`sudo hmon at "2026-11-06 08:44"` prints the nearest snapshot as text with 30-minute trend lines, for piping or
-pasting.
+**Time zone.** Times show in the host's zone. Change it in F2 Setup (Left/Right cycles common zones, Enter types any:
+`Asia/Kolkata`, `UTC`, `IST`, `+05:30`), with `--tz`, or with `TZ`. Settings are saved to `~/.config/hmon/hmonrc`.
 
-**Time zone.** Times are shown and read in the host's time zone (see `timedatectl`). Pick another with `--tz`:
-`sudo hmon --tz Asia/Kolkata`, `sudo hmon --tz UTC at "2026-11-06 03:14"`, or the standard `TZ` variable. A time typed
-with an offset, like `2026-11-06T08:44+05:30`, is read as written. The CSV files are always UTC.
+Options, as in htop: `-C` monochrome (also `NO_COLOR`), `-U` ASCII only, `-F FILTER`, `-s COLUMN`, `-d DELAY`
+(tenths of a second for the live refresh), `-M` no mouse, `-V` version.
 
-To browse elsewhere, copy the data off the host and point `hmon.py` at it:
+**Memory.** Like htop, which holds only the current process list, the viewer holds only what is on screen: it keeps
+a small index of where each sample starts in a day's file and reads just the samples of the column under the marker,
+one at a time. A long column (a day, or an hour of 10 s samples) reads at most 240 samples, evenly spread, for the
+table, and the title says so; the graph uses every sample. A day of 10 s samples for 100 processes (98 MB) is browsed
+in about 10 MB, where loading the file would take about 120 MB. `export` and `sql` stream through temporary files.
+
+## Dumps and queries
+
+Take a dump of an instance and analyse it anywhere:
 
 ```
-sudo tar czf hmon-data.tgz -C /var/lib/hmon .
-mkdir hmon-data && tar xzf hmon-data.tgz -C hmon-data && python3 hmon.py --tz Asia/Kolkata hmon-data
+hmon export --from "12/10/2026 13:00 IST" --to "12/10/2026 15:00 IST" -o incident.tar.gz
+hmon incident.tar.gz
 ```
+
+Or query it with SQL (SQLite is built into Python; tables `host`, `containers`, `processes`, where every process row
+also has its `app`):
+
+```
+hmon sql "SELECT app, max(rss) / 1048576 AS peak_mib FROM processes GROUP BY app ORDER BY peak_mib DESC" incident.tar.gz
+hmon export --sqlite incident.db --from "12/10/2026 13:00 IST"
+```
+
+`export` and `sql` cover the last 24 hours unless `--from` / `--to` say otherwise. `hmon at "12/10/2026 14:30 IST"`
+prints one snapshot as text, for pasting.
 
 ## After an incident
 
 1. Did the host reboot? `last -x reboot shutdown | head`. A line ending in `crash` means it went down without a
-   clean shutdown. `sudo journalctl --list-boots` shows when each boot's log ends.
-2. Which container died, and how? `sudo journalctl -u hmon-events --since "2026-11-06 08:15"`.
+   clean shutdown.
+2. Which container died, and how? `sudo journalctl -u hmon-events --since "2026-10-12 14:00"`.
    Exit code 137 = killed (usually out of memory), 143 = stopped, 139 = segfault.
-3. What did the kernel kill for memory?
-   `sudo journalctl _TRANSPORT=kernel --since "2026-11-06 08:15" | grep -iE 'oom|out of memory'`.
-4. What grew? `sudo hmon`, press `g` and enter a time just before it. When memory runs out the kernel kills the
+3. What did the kernel kill for memory? `sudo journalctl -k -b -1 | grep -iE 'oom|out of memory'`.
+4. What grew? `hmon`, `g`, a time just before it, `s` for Maximum. When memory runs out the kernel kills the
    biggest process, which is not necessarily the one that grew, so look at what climbed in the minutes before.
+
+## Privacy
+
+Like `/proc`, the recorded command lines are readable by the host's users. Values that look like credentials
+(`user:password@` in URLs, `password=…`, `token=…`, `--password …`, `--api-key …`) are replaced with `***` before
+they are written. The masking is pattern-based and misses forms such as `mysql -pSECRET`, so treat dumps as sensitive.
 
 ## Data
 
 | File | Columns |
 | --- | --- |
-| `host_YYYY-MM-DD.csv` | ts, cpu_percent, load_1m, mem_total_bytes, mem_available_bytes, swap_used_bytes |
-| `containers_YYYY-MM-DD.csv` | ts, container, cpu_percent, mem_bytes, mem_limit_bytes, net_rx_bytes, net_tx_bytes, block_read_bytes, block_write_bytes, pids |
-| `processes_YYYY-MM-DD.csv` | ts, pid, container, name, rss_bytes, cpu_percent, cmdline |
+| `host_YYYY-MM-DD.csv` | ts, cpu_percent, load_1m, mem_total_bytes, mem_available_bytes, swap_used_bytes, load_5m, load_15m, swap_total_bytes |
+| `containers_YYYY-MM-DD.csv` | ts, container, cpu_percent, mem_bytes, mem_limit_bytes, net_rx_bytes, net_tx_bytes, block_read_bytes, block_write_bytes, pids, id |
+| `processes_YYYY-MM-DD.csv` | ts, pid, container, name, rss_bytes, cpu_percent, cmdline, ppid, cgroup |
 
-All three share the same `ts` (UTC) per sample. They load directly into DuckDB, pandas or a spreadsheet, e.g. to
-Parquet: `duckdb -c "COPY (FROM read_csv('processes_*.csv')) TO 'processes.parquet'"`. Filter times with an explicit
-offset (`'2026-11-06 02:45:00+00'`) so DuckDB doesn't read them in your local time zone.
+All three share `ts` (UTC) per sample. New columns are only ever added at the end, so older files stay readable.
 
 ## Tests and releases
 
-`python3 -m unittest` runs the tests (Linux or macOS; no dependencies). GitHub Actions runs them on Python 3.7 and a
-current Python for every push and pull request.
+`python3 -m unittest` runs the end-to-end tests: a fake host is sampled, then the real viewer is driven with keys and
+the mouse, and the data is exported and queried. GitHub Actions runs them on Python 3.7 and a current Python.
 
-To release, push a version tag: `git tag v0.1.0 && git push origin v0.1.0`. The workflow tests, then publishes a GitHub
-release with `install.sh` and `hmon.py` stamped with the repository and version, which is what the install command
-downloads.
+To release, push a version tag: `git tag v0.2.0 && git push origin v0.2.0`. The workflow tests, then publishes a
+GitHub release with `install.sh` and `hmon.py` stamped with the repository and version.

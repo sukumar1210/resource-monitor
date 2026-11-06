@@ -1,11 +1,12 @@
 #!/bin/bash
-# Installs hmon on a systemd-based Linux host: a per-minute record of host, container and process usage
-# that survives reboots, plus a persistent kernel log and Docker exit events for explaining crashes.
+# Installs hmon on a systemd-based Linux host: a record of host, app, container and process usage that survives
+# reboots, plus a persistent kernel log and Docker exit events for explaining crashes. It asks how often to sample
+# and how many days to keep, showing the disk that takes; INTERVAL and RETENTION_DAYS answer without asking.
 #
-#   curl -fsSL https://github.com/OWNER/resource-monitor/releases/latest/download/install.sh | sudo bash
-#   sudo ./install.sh                       the same from a clone; installs the hmon.py next to it
-#   sudo RETENTION_DAYS=30 ./install.sh     keep a different number of days (default 14)
-#   sudo ./install.sh uninstall             remove hmon; recorded data in /var/lib/hmon is left in place
+#   curl -fsSL https://github.com/sukumar1210/resource-monitor/releases/latest/download/install.sh | sudo bash
+#   sudo ./install.sh                                   the same from a clone; installs the hmon.py next to it
+#   sudo INTERVAL=10 RETENTION_DAYS=3 ./install.sh      no questions: a sample every 10 s, kept 3 days
+#   sudo ./install.sh uninstall                         remove hmon; recorded data in /var/lib/hmon is left in place
 
 set -euo pipefail
 
@@ -28,10 +29,39 @@ if [ "${1:-}" = uninstall ]; then
 fi
 
 python3 -c 'import sys; sys.exit(sys.version_info < (3, 7))' 2>/dev/null || { echo "hmon needs Python 3.7+ as python3"; exit 1; }
-# An update keeps the retention of the earlier install unless RETENTION_DAYS is given
-previous_days=$(sed -n 's|^d /var/lib/hmon .* \([0-9][0-9]*\)d$|\1|p' /etc/tmpfiles.d/hmon.conf 2>/dev/null || true)
-RETENTION_DAYS=${RETENTION_DAYS:-${previous_days:-14}}
 previous_version=$(hmon --version 2>/dev/null || true)
+
+ask() {  # ask QUESTION DEFAULT: the answer typed at the terminal (even when this script comes through a pipe)
+    local answer=''
+    if { : < /dev/tty; } 2>/dev/null; then
+        read -r -p "$1 [$2]: " answer < /dev/tty || true
+    fi
+    echo "${answer:-$2}"
+}
+
+mb_per_day() {  # mb_per_day SECONDS: ~150 bytes per process per sample
+    echo $(( 86400 / $1 * processes * 150 / 1000000 ))
+}
+
+# How often to sample and how long to keep it; an update offers the earlier install's answers
+previous_interval=$(sed -n 's|^Environment=HMON_INTERVAL=\([0-9][0-9]*\)$|\1|p' /etc/systemd/system/hmon.service 2>/dev/null || true)
+previous_days=$(sed -n 's|^d /var/lib/hmon .* \([0-9][0-9]*\)d$|\1|p' /etc/tmpfiles.d/hmon.conf 2>/dev/null || true)
+processes=$(awk '$2 > 0' /proc/[0-9]*/statm 2>/dev/null | wc -l)
+if [ -z "${INTERVAL:-}" ] || [ -z "${RETENTION_DAYS:-}" ]; then
+    echo "hmon records every process. This host runs about $processes, so one day of samples takes about:"
+    for seconds in 10 30 60 300; do
+        printf '  a sample every %4s s   %6s MB\n' "$seconds" "$(mb_per_day "$seconds")"
+    done
+    echo "The viewer can still zoom out to 15 min, 1 hour or 1 day; finer than the samples just shows gaps."
+fi
+INTERVAL=${INTERVAL:-$(ask "Seconds between samples" "${previous_interval:-60}")}
+RETENTION_DAYS=${RETENTION_DAYS:-$(ask "Days to keep" "${previous_days:-14}")}
+for answer in "$INTERVAL" "$RETENTION_DAYS"; do
+    case $answer in
+        ''|*[!0-9]*|0) echo "Expected a whole number above 0, got '$answer'"; exit 1 ;;
+    esac
+done
+echo "Sampling every ${INTERVAL} s and keeping ${RETENTION_DAYS} days: about $(( $(mb_per_day "$INTERVAL") * RETENTION_DAYS )) MB on disk."
 
 # Persistent journal, so kernel OOM reports and container events survive a reboot
 mkdir -p /etc/systemd/journald.conf.d /var/log/journal
@@ -39,7 +69,7 @@ printf '[Journal]\nSyncIntervalSec=30s\n' > /etc/systemd/journald.conf.d/hmon.co
 systemd-tmpfiles --create --prefix /var/log/journal
 journalctl --flush
 
-# The collector; systemd-tmpfiles creates the root-only data directory and deletes files older than RETENTION_DAYS
+# The collector; systemd-tmpfiles creates the data directory and deletes files older than RETENTION_DAYS
 if [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "$(dirname "${BASH_SOURCE[0]}")/hmon.py" ]; then
     install -m 755 "$(dirname "${BASH_SOURCE[0]}")/hmon.py" /usr/local/bin/hmon
 else  # piped from curl
@@ -53,14 +83,24 @@ else  # piped from curl
     install -m 755 "$download" /usr/local/bin/hmon
     rm -f "$download"
 fi
-echo "d /var/lib/hmon 0700 root root ${RETENTION_DAYS}d" > /etc/tmpfiles.d/hmon.conf
+# Like htop: everyone sees what /proc shows them. Where /proc hides other users' processes (hidepid), so does hmon.
+if awk '$2 == "/proc" && $4 ~ /hidepid=(1|2|noaccess|invisible)/ { found = 1 } END { exit !found }' /proc/mounts; then
+    data_mode=0700
+else
+    data_mode=0755
+fi
+echo "d /var/lib/hmon $data_mode root root ${RETENTION_DAYS}d" > /etc/tmpfiles.d/hmon.conf
 systemd-tmpfiles --create /etc/tmpfiles.d/hmon.conf
-cat > /etc/systemd/system/hmon.service <<'EOF'
+if [ "$data_mode" = 0755 ]; then
+    chmod -R go+rX /var/lib/hmon  # files from v0.1.0 were root-only
+fi
+cat > /etc/systemd/system/hmon.service <<EOF
 [Unit]
-Description=hmon: per-minute host, container and process usage in /var/lib/hmon
+Description=hmon: host, app, container and process usage in /var/lib/hmon
 After=docker.service
 
 [Service]
+Environment=HMON_INTERVAL=${INTERVAL}
 ExecStart=/usr/local/bin/hmon collect
 Restart=always
 RestartSec=10
@@ -98,4 +138,9 @@ version=$(hmon --version)
 if [ -n "$previous_version" ] && [ "$previous_version" != "$version" ]; then
     echo "Updated $previous_version -> $version"
 fi
-echo "$version is recording to /var/lib/hmon (root only), kept ${RETENTION_DAYS} days. Open the viewer with: sudo hmon"
+echo "$version is recording to /var/lib/hmon, kept ${RETENTION_DAYS} days."
+if [ "$data_mode" = 0755 ]; then
+    echo "Open the viewer with: hmon"
+else
+    echo "This host hides other users' processes (hidepid), so like htop, hmon needs root to show them: sudo hmon"
+fi
