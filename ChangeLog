@@ -1,3 +1,11 @@
+What's new in version 0.2.5
+
+* hmon update installs the newest release (asking for sudo), keeping the interval and retention already set
+* The viewer says "New update available" at the bottom right when a newer release is out; it asks GitHub once at
+  start, in the background, and stays quiet without network
+* Key bars: a space between each key and what it does, and two between items (F1 Help  F2 Setup); keys that don't
+  fit whole are left off instead of cut
+
 What's new in version 0.2.4
 
 * Dragging keeps up with the mouse: while the button is held only the highlight is repainted, not the whole screen,

@@ -27,7 +27,7 @@ what was eating memory or CPU. The newest column updates live, like htop.
  942377  11264    0.0   0.1  └─ /usr/bin/containerd-shim-runc-v2 -namespace moby -id 7526c2cf3b57
           330M    0.0   2.8  + market-recorder    1 process
           180M    0.0   1.5  + actions.runner.homelab    2 processes
-F1Help  F2Setup F3Search F4Filter F5List  F6SortBy F10Quit  ← / →Time  [ / ]Zoom  sStat  gGoTo  TabGraph
+F1 Help  F2 Setup  F3 Search  F4 Filter  F5 List  F6 SortBy  F10 Quit  ← / → Time  [ / ] Zoom  s Stat  g GoTo  Tab Graph
 ```
 
 (A real screen on demo data, trimmed to fit: `docker` unfolded, its containers folded. Memory figures are htop's:
@@ -59,8 +59,9 @@ is printed as it runs (`==> ...`).
 
 - No questions: `... | sudo INTERVAL=60 RETENTION_DAYS=14 bash`
 - A specific release: `.../releases/download/v0.2.2/install.sh` in place of `.../releases/latest/download/install.sh`.
-- Update: run the install command again. It keeps your answers and the data without asking; change the answers in
-  F2 Setup or with `sudo hmon configure --interval SECONDS --retention DAYS`.
+- Update: `hmon update` (it asks for sudo) runs the newest release's installer, which keeps your answers and the data
+  without asking; change the answers in F2 Setup or with `sudo hmon configure --interval SECONDS --retention DAYS`.
+  When a newer release is out, the viewer says so at the bottom right.
 - If journald keeps its log in memory (`Storage=volatile`, as with log2ram), the installer says so and moves on: the
   kernel's OOM reports then won't survive a reboot, though hmon's own samples do.
 - Remove: `... | sudo bash -s -- uninstall` (the data in `/var/lib/hmon` is left for you to delete).
@@ -160,6 +161,9 @@ prints one snapshot as text, for pasting.
 Like `/proc`, the recorded command lines are readable by the host's users. Values that look like credentials
 (`user:password@` in URLs, `password=…`, `token=…`, `--password …`, `--api-key …`) are replaced with `***` before
 they are written. The masking is pattern-based and misses forms such as `mysql -pSECRET`, so treat dumps as sensitive.
+
+The viewer asks GitHub's API (`api.github.com`) once when it starts whether a newer release is out; nothing about the
+host is sent. Without network access the check gives up quietly. The collector service never connects anywhere.
 
 ## Data
 

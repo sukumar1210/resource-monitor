@@ -11,6 +11,7 @@ import contextlib
 import csv
 import glob
 import io
+import json
 import locale
 import logging
 import math
@@ -23,7 +24,9 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 import time
+import urllib.request
 from array import array
 from bisect import bisect_left
 from collections import defaultdict, namedtuple
@@ -37,6 +40,7 @@ except ImportError:  # some minimal Python builds; only the viewer needs it
     curses = None
 
 VERSION = 'dev'  # set from the git tag by the release workflow
+REPO = 'sukumar1210/resource-monitor'  # where releases come from, set by the release workflow
 DATA_DIR = os.environ.get('HMON_DATA_DIR', '/var/lib/hmon')
 INTERVAL_SECONDS = int(os.environ.get('HMON_INTERVAL', '60'))  # the service's sampling interval, set by install.sh
 SYSTEM_TZ = os.environ.get('TZ')
@@ -1016,6 +1020,7 @@ class Viewer:
         self.mouse, self.mouse_on = mouse, settings.get('mouse', 'on') == 'on'  # -M turns it off for this run only
         self.regions, self.row_top, self.tree_x = [], 0, 0  # clickable areas of the last frame
         self.shown, self.pressed_at, self.dragged_to, self.held = {}, None, None, False
+        self.update_available = False
         self.glyphs = GLYPHS if unicode else ASCII_GLYPHS
         self.styles = self.make_styles(use_color and curses.has_colors())
         self.columns, self.graph_values = {}, {}  # caches, by column start and the settings that shape them
@@ -1116,6 +1121,19 @@ class Viewer:
             self.put(y, x, text, style)
             x += len(text)
         return x
+
+    def put_keys(self, y, items, limit=None):
+        """A bar of (key, what it does) along row `y`: `F1 Help  F2 Setup`, leaving off the items that won't fit
+        whole before column `limit` (the screen's edge by default). Returns where each drawn item starts and ends."""
+        limit = self.screen.getmaxyx()[1] - 1 if limit is None else limit
+        spans, x = [], 0
+        for key, name in items:
+            if x + len(key) + 1 + len(name) > limit:
+                break
+            end = self.put_segments(y, x, [(key, 'key'), (f' {name}', 'label')])
+            spans.append((x, end))
+            x = end + 2
+        return spans
 
     # ---- data
 
@@ -1316,33 +1334,34 @@ class Viewer:
                 self.put_segments(top + 1 + i, 0, segments)
 
     def draw_function_bar(self, y, width):
-        """htop's function bar: F-key text, then a 6-column label on cyan; search and filter take over the bar."""
+        """The keys along the bottom, each clickable; search and filter take over the bar."""
         g = self.glyphs
         if self.mode == 'search':
-            items = [('F3', 'Next  ', curses.KEY_F3), ('S-F3', 'Prev   ', curses.KEY_F15), ('Esc', 'Cancel ', 27)]
+            items = [('F3', 'Next', curses.KEY_F3), ('S-F3', 'Prev', curses.KEY_F15), ('Esc', 'Cancel', 27)]
             prompt, text = ' Search: ', self.search
         elif self.mode == 'filter':
-            items, prompt, text = [('Enter', 'Done  ', 10), ('Esc', 'Clear ', 27)], ' Filter: ', self.filter
+            items, prompt, text = [('Enter', 'Done', 10), ('Esc', 'Clear', 27)], ' Filter: ', self.filter
         else:
-            items = [('F1', 'Help  ', curses.KEY_F1), ('F2', 'Setup ', curses.KEY_F2), ('F3', 'Search', curses.KEY_F3),
+            items = [('F1', 'Help', curses.KEY_F1), ('F2', 'Setup', curses.KEY_F2), ('F3', 'Search', curses.KEY_F3),
                      ('F4', 'FILTER' if self.filter else 'Filter', curses.KEY_F4),
-                     ('F5', 'List  ' if self.tree else 'Tree  ', curses.KEY_F5), ('F6', 'SortBy', curses.KEY_F6),
-                     ('F10', 'Quit  ', curses.KEY_F10), (g['left_right'], 'Time  ', None), ('[ / ]', 'Zoom  ', ord('[')),
-                     ('s', 'Stat  ', ord('s')), ('g', 'GoTo  ', ord('g')), ('Tab', 'Graph ', ord('\t'))]
+                     ('F5', 'List' if self.tree else 'Tree', curses.KEY_F5), ('F6', 'SortBy', curses.KEY_F6),
+                     ('F10', 'Quit', curses.KEY_F10), (g['left_right'], 'Time', None), ('[ / ]', 'Zoom', ord('[')),
+                     ('s', 'Stat', ord('s')), ('g', 'GoTo', ord('g')), ('Tab', 'Graph', ord('\t'))]
             prompt = text = None
         self.put(y, 0, ' ' * (width - 1), 'label')
         if self.notice and not self.mode:
             self.put(y, 0, f' {self.notice}', 'label')
             return
-        x = 0
-        for key, name, code in items:
-            name = name if name.endswith(' ') else name + ' '  # a full 6-letter label shouldn't run into the next key
-            end = self.put_segments(y, x, [(key, 'key'), (name, 'label')])
+        update = ' New update available, Run: "hmon update" ' if self.update_available and prompt is None else ''
+        right = width - 1 - len(update)  # the notice sits at the bottom right, and keys that would reach it make way
+        spans = self.put_keys(y, [(key, name) for key, name, _ in items], right - 1)
+        for (x0, x1), (_, _, code) in zip(spans, items):
             if code is not None:
-                self.regions.append((y, y, x, end, lambda cx, cy, c=code: self.press(c)))
-            x = end
+                self.regions.append((y, y, x0, x1, lambda cx, cy, c=code: self.press(c)))
+        if update:
+            self.put(y, right, update, 'header')
         if prompt is not None:
-            x = self.put_segments(y, x, [(prompt, 'label')])
+            x = self.put_segments(y, (spans[-1][1] if spans else 0) + 1, [(prompt, 'label')])
             self.put(y, x, text, 'failed' if self.mode == 'search' and self.search_failed else 'label')
             self.cursor_x = x + len(text)
 
@@ -1523,8 +1542,8 @@ class Viewer:
                 text = f' {describe(shown[top + i])}' if top + i < len(shown) else ' no match'
                 self.put(y + 1 + i, x, text[:box].ljust(box), 'selected' if shown and top + i == index else 'normal')
             self.put(height - 1, 0, ' ' * (width - 1), 'label')
-            self.put_segments(height - 1, 0, [('Enter', 'key'), ('Pick  ', 'label'), ('Esc', 'key'), ('Cancel ', 'label'),
-                                              ('  ', 'key'), ('type to filter', 'label')])
+            end = self.put_keys(height - 1, [('Enter', 'Pick'), ('Esc', 'Cancel')])[-1][1]
+            self.put(height - 1, end + 2, 'type to filter', 'label')
             self.refresh()
             key = self.screen.getch()
             if key in (curses.KEY_UP, curses.KEY_DOWN):
@@ -1576,7 +1595,7 @@ class Viewer:
                          'selected' if i == choice else 'normal')
             self.put(self.setting_row(len(names)) + 1, 2, f'Saved to {CONFIG_PATH} when you leave this screen.', 'shadow')
             self.put(height - 1, 0, ' ' * (width - 1), 'label')
-            self.put_segments(height - 1, 0, [('Enter', 'key'), ('Pick  ', 'label'), ('Esc', 'key'), ('Done  ', 'label')])
+            self.put_keys(height - 1, [('Enter', 'Pick'), ('Esc', 'Done')])
 
         while True:
             height, width = self.screen.getmaxyx()
@@ -1602,7 +1621,7 @@ class Viewer:
                     if row is not None:  # a setting: select it, then open its list
                         pick, choice = row == choice, row
                     elif click_y == height - 1:
-                        if click_x >= len('EnterPick  '):
+                        if click_x >= len('Enter Pick  '):  # on Esc Done
                             break
                         pick = True
             elif key in (27, ord('q'), curses.KEY_F2, curses.KEY_F10):
@@ -1645,7 +1664,7 @@ class Viewer:
             for i, option in enumerate(options):
                 self.put(self.table_top + 1 + i, 0, f' {option}'.ljust(14), 'selected' if i == choice else 'normal')
             self.put(height - 1, 0, ' ' * (width - 1), 'label')
-            self.put_segments(height - 1, 0, [('Enter', 'key'), ('Sort  ', 'label'), ('Esc', 'key'), ('Cancel', 'label')])
+            self.put_keys(height - 1, [('Enter', 'Sort'), ('Esc', 'Cancel')])
             self.refresh()
             key = self.screen.getch()
             if key == curses.KEY_UP:
@@ -1943,11 +1962,17 @@ class Viewer:
             self.toggle_all()
         return True
 
+    def check_for_update(self):
+        newest = newest_release(timeout=10)
+        self.update_available = bool(newest and is_newer(newest))
+
     def run(self):
         self.show_cursor(0)
         self.blocking(False)
         self.apply_mouse()
         self.tick()
+        if VERSION != 'dev':  # a release asks GitHub once, in the background, whether there's a newer one
+            threading.Thread(target=self.check_for_update, daemon=True).start()
         while True:
             if not self.held:  # mid-drag only the highlight changes, and mouse_event has painted it
                 self.draw()
@@ -2085,6 +2110,47 @@ def check_readable(csv_dir):
                  '(hidepid). Run hmon with sudo, as htop needs root to see them too.')
 
 
+# ---------------------------------------------------------------- updates
+
+def newest_release(timeout):
+    """The newest release's version, e.g. 0.2.5, or None when GitHub can't be reached."""
+    try:
+        with urllib.request.urlopen(f'https://api.github.com/repos/{REPO}/releases/latest', timeout=timeout) as reply:
+            return json.load(reply)['tag_name'].lstrip('v')
+    except Exception:  # offline, firewalled or rate limited: no news, and nothing to show for it
+        return None
+
+
+def is_newer(version):
+    """Whether `version` is a later release than this one; a build from source is never behind."""
+    try:
+        return tuple(map(int, version.split('.'))) > tuple(map(int, VERSION.split('.')))
+    except ValueError:
+        return False
+
+
+def update():
+    """Runs the newest release's installer, which keeps the sampling interval and retention already set."""
+    newest = newest_release(timeout=15)
+    if newest is None:
+        sys.exit(f'Could not reach GitHub to look up the newest release of {REPO}.')
+    if not is_newer(newest):
+        print(f'hmon {VERSION} is up to date.')
+        return
+    if os.geteuid() != 0:  # the installer replaces /usr/local/bin/hmon and restarts the service
+        try:
+            os.execvp('sudo', ['sudo', sys.executable, os.path.abspath(sys.argv[0]), 'update'])
+        except OSError:
+            sys.exit(f'hmon {newest} is out; updating needs root, so run `hmon update` as root.')
+    url = f'https://github.com/{REPO}/releases/download/v{newest}/install.sh'
+    try:
+        with urllib.request.urlopen(url, timeout=120) as reply:
+            installer = reply.read()
+    except OSError as error:
+        sys.exit(f'Could not download {url}: {error}')
+    sys.exit(subprocess.run(['bash'], input=installer).returncode)
+
+
 def main(argv):
     parser = argparse.ArgumentParser(
         prog='hmon',
@@ -2093,6 +2159,7 @@ def main(argv):
               '       %(prog)s [options] export [--from TIME] [--to TIME] [-o FILE.tar.gz | --sqlite FILE.db] [SOURCE]\n'
               '       %(prog)s [options] sql "SELECT ..." [--from TIME] [--to TIME] [SOURCE]\n'
               '       %(prog)s configure [--interval SECONDS] [--retention DAYS]\n'
+              '       %(prog)s update\n'
               '       %(prog)s collect',
         description=f'hmon {VERSION} - htop for the past: what every app, container and process used, over time, '
                     'recorded by the hmon service and browsed here.',
@@ -2151,6 +2218,8 @@ def main(argv):
     words = args.words
     if words == ['collect']:
         collect()
+    elif words == ['update']:
+        update()
     elif words == ['configure']:
         interval, days = recording()
         if interval is None:

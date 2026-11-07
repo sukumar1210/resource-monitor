@@ -223,7 +223,7 @@ class EndToEnd(unittest.TestCase):
         self.assertNotIn('openalgo', filtered)
         self.assertIn('+ docker', frames[14])  # Esc in the filter bar clears it; apps are folded again
         self.assertIn('RES▽', frames[15])  # a click on a column title sorts by it
-        self.assertIn('F3Search F4Filter', frames[15])  # full-width labels keep a space before the next key
+        self.assertIn('F2 Setup  F3 Search  F4 Filter', frames[15])  # each key apart from its label and the next
         self.assertIn('Time zone (type to filter)', frames[17].replace('   ', ' '))  # Enter opens a dropdown
         zones = frames[21]
         self.assertIn('Time zone: kolk', zones)
@@ -280,6 +280,41 @@ class EndToEnd(unittest.TestCase):
         self.assertIn(b'Quit', shown)
         self.assertNotIn(b'Traceback', shown)
         self.assertEqual(os.WEXITSTATUS(status), 130)
+
+    def test_a_newer_release_is_announced_and_installed(self):
+        data_dir = self.history()
+        requested = []
+
+        def github(url, timeout):  # the releases API, and the newest release's installer
+            requested.append(url)
+            return io.BytesIO(b'{"tag_name": "v0.2.5"}' if 'api.github.com' in url else b'echo installing')
+
+        class Inline:  # runs the background check at once, so the first frame shows what it found
+            def __init__(self, target, daemon):
+                self.start = target
+
+        with mock.patch.object(hmon, 'VERSION', '0.2.4'), mock.patch.object(hmon.threading, 'Thread', Inline), \
+                mock.patch.object(hmon.urllib.request, 'urlopen', side_effect=github):
+            bar = browse(data_dir, [])[0].split('\n')[45]
+            with mock.patch.object(hmon.os, 'geteuid', return_value=1000), \
+                    mock.patch.object(hmon.os, 'execvp', side_effect=SystemExit) as sudo, self.assertRaises(SystemExit):
+                hmon.main(['update'])
+            with mock.patch.object(hmon.os, 'geteuid', return_value=0), \
+                    mock.patch.object(hmon.subprocess, 'run', return_value=mock.Mock(returncode=0)) as run, \
+                    self.assertRaises(SystemExit) as done:
+                hmon.main(['update'])
+        self.assertTrue(bar.endswith('New update available, Run: "hmon update"'), bar)  # at the bottom right
+        self.assertEqual(sudo.call_args[0][1][:2], ['sudo', sys.executable])  # not root: it asks sudo to run it
+        self.assertEqual(sudo.call_args[0][1][-1], 'update')
+        self.assertEqual(requested[-1], f'https://github.com/{hmon.REPO}/releases/download/v0.2.5/install.sh')
+        run.assert_called_once_with(['bash'], input=b'echo installing')
+        self.assertEqual(done.exception.code, 0)
+
+        with mock.patch.object(hmon, 'VERSION', '0.2.5'), \
+                mock.patch.object(hmon.urllib.request, 'urlopen', side_effect=github), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            hmon.main(['update'])
+        self.assertIn('hmon 0.2.5 is up to date.', out.getvalue())
 
     def test_setup_changes_what_the_installer_asked(self):
         data_dir = self.history()
