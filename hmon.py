@@ -399,6 +399,7 @@ LIVE_HOST_SECONDS = 900  # the viewer's own live host samples kept for the graph
 LIVE_PROCESS_SECONDS = 60  # and its live process samples, which are much bigger
 SAMPLE_LIMIT = 240  # samples a column reads for the table at most, evenly spread; the graph stays exact
 COLUMN_CACHE = 64  # columns kept computed
+X10_COLUMNS = 223  # the old mouse reports (X10) carry a column in one byte, so a click can't say one past this
 NOW_ZOOM = 60  # live bars this short show what runs now; longer ones keep their statistic, so a peak stays findable
 RELOAD_SECONDS = 30
 
@@ -1081,6 +1082,7 @@ class Viewer:
         self.regions, self.row_top, self.tree_x = [], 0, 0  # clickable areas of the last frame
         self.shown, self.pressed_at, self.dragged_to, self.held = {}, None, None, False
         self.update_available = False
+        self.mouse_reach = None  # the last column a click can say, where the terminal reports the mouse the old way
         self.anchor, self.bar_starts, self.graph_area = None, None, None  # a range of bars, from anchor to the marker
         self.glyphs = GLYPHS if unicode else ASCII_GLYPHS
         self.styles = self.make_styles(use_color and curses.has_colors())
@@ -1142,6 +1144,9 @@ class Viewer:
             self.screen.refresh()  # ncurses' own mouse switch goes out first, or it would undo the next line
             sys.stdout.write('\033[?1002h' if on else '\033[?1002l')  # report drags too, so hmon can select text
             sys.stdout.flush()
+            sgr = ((curses.tigetstr('kmous') or b'').startswith(b'\033[<')
+                   or b'1006' in (curses.tigetstr('XM') or b''))  # the terminfo says how ncurses asks for reports
+            self.mouse_reach = None if sgr or not on else X10_COLUMNS
         except curses.error:
             pass
 
@@ -1255,7 +1260,8 @@ class Viewer:
 
     def draw(self):
         height, width = self.screen.getmaxyx()
-        self.width, self.graph_w = width, max(10, width - 8)
+        self.width = width
+        self.graph_w = max(10, min(width, self.mouse_reach or width) - 8)  # every bar where a click can reach it
         first, last = self.align(self.store.times[0]), self.align(self.store.times[-1])
         self.cursor = min(max(self.align(self.cursor), first), last)
         self.view_end = min(max(self.align(self.view_end), self.cursor), self.cursor + (self.graph_w - 1) * self.zoom)

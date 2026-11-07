@@ -103,7 +103,8 @@ leaves `/usr/local/bin` off its PATH on some systems, such as Amazon Linux).
 
 The mouse acts when the button is released: click a row, a fold marker, a column title (again to reverse), a graph
 tab, a point on the graph, or a function-bar item; the wheel scrolls the table, or moves through time over the graph.
-Drag across the graph to pick a range of bars for the table, as Space does.
+Drag across the graph to pick a range of bars for the table, as Space does. Where the terminal reports the mouse
+the old way (X10, whose clicks can't say a column past 223), the graph stays within those columns.
 
 **Copying text.** A terminal hands every click and drag to a program that uses the mouse, so it can't select text
 itself. hmon does the selecting instead: hold the button and drag, and what you drag over is highlighted and copied

@@ -1,3 +1,8 @@
+What's new in version 0.2.9
+
+* Graph clicks and drags land on the bar under the pointer in wide terminals too: where mouse reports are the old X10
+  kind, which can't say a column past 223, the graph now stays within those columns instead of running out of reach
+
 What's new in version 0.2.8
 
 * Installer: no "hmon: command not found" at the end of an update where sudo leaves /usr/local/bin off its PATH
