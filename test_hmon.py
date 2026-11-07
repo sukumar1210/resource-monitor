@@ -88,6 +88,15 @@ def proc_files(pid, ppid, command, cgroup, rss, ticks, start='100'):
             f'/proc/{pid}/cgroup': f'0::{cgroup}\n', f'/proc/{pid}/cmdline': command.replace(' ', '\0')}
 
 
+class Live:
+    """Stands in for /proc, a little after the last recorded sample: one new process, probe."""
+
+    def sample(self):
+        ts = '2026-11-06T04:00:30Z'
+        return hmon.to_second(ts), [ts, 30.0, 1.0, 8 * GiB, 4 * GiB, 0, 1, 1, 0], [
+            [ts, 900, '', 'probe', 50 * MiB, 2.0, 'probe --live', 1, '/system.slice/probe.service']]
+
+
 class EndToEnd(unittest.TestCase):
     def setUp(self):
         os.environ['TZ'] = 'UTC'
@@ -193,13 +202,6 @@ class EndToEnd(unittest.TestCase):
 
     def test_browse_history_like_a_cloudwatch_graph(self):
         data_dir = self.history()
-
-        class Live:  # stands in for /proc, a little after the last recorded sample
-            def sample(self):
-                ts = '2026-11-06T04:00:30Z'
-                return hmon.to_second(ts), [ts, 30.0, 1.0, 8 * GiB, 4 * GiB, 0, 1, 1, 0], [
-                    [ts, 900, '', 'probe', 50 * MiB, 2.0, 'probe --live', 1, '/system.slice/probe.service']]
-
         header_click = (0, 10, 19, 0, hmon.curses.BUTTON1_RELEASED)  # the RES title of the table header
         go_to = [ord(c) for c in '6/11/2026 08:44 IST'] + [10]
         keys = ([ord('g')] + go_to + [ord('['), ord('['), ord('s'), ord('\t'), ord('\t'), ord('\t'), hmon.curses.KEY_BTAB,
@@ -234,6 +236,91 @@ class EndToEnd(unittest.TestCase):
         self.assertIn('times in IST', frames[25])
         with open(hmon.CONFIG_PATH) as f:
             self.assertIn('tz=Asia/Kolkata', f.read())
+
+    def test_a_range_of_bars_becomes_table_columns(self):
+        data_dir = self.history()
+        c = hmon.curses
+        drag = [(0, 145, 10, 0, c.BUTTON1_PRESSED), (0, 146, 10, 0, c.REPORT_MOUSE_POSITION),
+                (0, 147, 10, 0, c.BUTTON1_RELEASED)]  # over the graph's last three bars: 02:00, 03:00, 04:00
+        keys = [ord('[')] * 4 + [ord(' '), c.KEY_LEFT, 27] + [c.KEY_MOUSE] * 3  # 1 hour bars; Space, back one, Esc
+        terminal = io.StringIO()
+        with contextlib.redirect_stdout(terminal):
+            frames = browse(data_dir, keys, sampler=Live(), clicks=drag)
+
+        def table(frame):
+            lines = frame.split('\n')
+            return lines[next(i for i, line in enumerate(lines) if 'PID' in line):]
+
+        ranged = table(frames[6])
+        self.assertRegex(ranged[0], r'PID\s+06 Nov 03:00▽\s+06 Nov 04:00\s+App / Process')  # ordered by the marker's bar
+        self.assertRegex(next(line for line in ranged if '+ leak' in line), r'170M\s+-\s+\+ leak')  # not running live
+        self.assertRegex(next(line for line in ranged if '+ probe' in line), r'-\s+50\.0M\s+\+ probe')  # live only
+        self.assertIn('2 bars in the table, Esc for one', frames[6])
+        self.assertRegex(table(frames[7])[0], r'PID\s+RES\s+CPU%\s+MEM%')  # Esc: one bar again
+        self.assertRegex(table(frames[10])[0], r'06 Nov 02:00\s+06 Nov 03:00\s+06 Nov 04:00▽')  # a drag on the graph
+        self.assertEqual(terminal.getvalue(), '')  # picks bars, and copies no text
+
+    def test_a_time_zone_is_found_by_its_abbreviation(self):
+        data_dir = self.history()
+        frames = browse(data_dir, [hmon.curses.KEY_F2, 10] + [ord(c) for c in 'ist'] + [27, 27])  # Setup, Time zone
+        found = frames[5]
+        self.assertIn('Time zone: ist', found)
+        self.assertRegex(found, r'Asia/Kolkata\s+UTC\+05:30 IST')  # IST is in the row, so typing it finds the zone
+        self.assertNotIn('America/New_York', found)
+
+    def test_the_live_column_shows_what_runs_now(self):
+        data_dir = self.history()
+        with mock.patch.object(hmon, 'DATA_DIR', data_dir):  # leak still ran at 04:00:10; at 04:00:30 only probe runs
+            ts = '2026-11-06T04:00:10Z'
+            hmon.append('host', hmon.HOST_FIELDS, [[ts, 20.0, 1.5, 8 * GiB, 6 * GiB, 0, 1.2, 1.0, 0]], '2026-11-06')
+            hmon.append('processes', hmon.PROCESS_FIELDS, [[ts, 500, '', 'leak', 100 * MiB, 5.0,
+                                                           '/opt/leak/bin/leak --serve', 1, '/system.slice/leak.service']],
+                        '2026-11-06')
+        frames = browse(data_dir, [ord('[')] * 5, sampler=Live())
+        now, today = frames[0], frames[5]
+        self.assertIn('+ probe', now)
+        self.assertNotIn('+ leak', now)  # 1 min bars: the live one shows now, so what stopped is gone at once
+        self.assertIn('30.0%', next(line for line in now.split('\n') if 'CPU[' in line))  # the live CPU
+        self.assertIn('Average per 1 day', today)
+        self.assertIn('+ leak', today)  # 1 day bars keep their statistic on the live one: today's peak stays findable
+
+    def test_uninstall_asks_about_the_samples_and_the_settings_apart(self):
+        data_dir = self.history()
+        installed = [os.path.join(self.dir.name, name) for name in ('hmon.service', 'hmon')]
+        for samples, settings in (('n', 'y'), ('y', 'n')):
+            os.makedirs(os.path.dirname(hmon.CONFIG_PATH), exist_ok=True)
+            for path in installed + [hmon.CONFIG_PATH]:
+                open(path, 'w').close()
+            with mock.patch.object(hmon, 'DATA_DIR', data_dir), mock.patch.object(hmon, 'INSTALLED_FILES', installed), \
+                    mock.patch.dict(os.environ), mock.patch.object(hmon.os, 'geteuid', return_value=0), \
+                    mock.patch.object(hmon.subprocess, 'run') as run, \
+                    mock.patch('builtins.input', side_effect=[samples, settings]) as asked, \
+                    contextlib.redirect_stdout(io.StringIO()) as out:
+                os.environ.pop('SUDO_USER', None)
+                hmon.main(['uninstall'])
+            self.assertIn('Delete the recorded samples in', asked.call_args_list[0][0][0])
+            self.assertIn('Delete the settings in', asked.call_args_list[1][0][0])
+            self.assertFalse(any(os.path.exists(path) for path in installed))  # the service and the command go
+            run.assert_any_call(['systemctl', 'disable', '--now', 'hmon'], stdout=hmon.subprocess.DEVNULL,
+                                stderr=hmon.subprocess.DEVNULL)
+            self.assertEqual(os.path.exists(data_dir), samples == 'n')  # each goes only on its own yes
+            self.assertEqual(os.path.exists(hmon.CONFIG_PATH), settings == 'n')
+            self.assertIn('Kept', out.getvalue())
+            self.assertIn('Deleted', out.getvalue())
+
+    def test_the_wheel_moves_through_time_on_either_ncurses_mouse_abi(self):
+        data_dir = self.history()
+        c = hmon.curses
+        over_graph = (0, 40, 8, 0)
+        for wheel_down in (c.BUTTON5_PRESSED, c.REPORT_MOUSE_POSITION):  # the old ABI has no button 5
+            with mock.patch.dict(vars(c)):
+                if wheel_down == c.REPORT_MOUSE_POSITION:
+                    del c.BUTTON5_PRESSED
+                frames = browse(data_dir, [c.KEY_MOUSE] * 2,
+                                clicks=[over_graph + (c.BUTTON4_PRESSED,), over_graph + (wheel_down,)])
+            times = [next(line for line in frame.split('\n') if 'Time:' in line) for frame in frames[:3]]
+            self.assertNotEqual(times[1], times[0])  # up: a column back
+            self.assertEqual(times[2], times[0])  # down: forward again
 
     def test_mouse_clicks_act_on_release(self):
         data_dir = self.history()
@@ -297,7 +384,8 @@ class EndToEnd(unittest.TestCase):
                 self.start = target
 
         with mock.patch.object(hmon, 'VERSION', '0.2.4'), mock.patch.object(hmon.threading, 'Thread', Inline), \
-                mock.patch.object(hmon.urllib.request, 'urlopen', side_effect=github):
+                mock.patch.object(hmon.urllib.request, 'urlopen', side_effect=github), \
+                contextlib.redirect_stdout(io.StringIO()) as progress:
             bar = browse(data_dir, [])[0].split('\n')[45]
             with mock.patch.object(hmon.os, 'geteuid', return_value=1000), \
                     mock.patch.object(hmon.os, 'execvp', side_effect=SystemExit) as sudo, self.assertRaises(SystemExit):
@@ -312,6 +400,7 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(requested[-1], f'https://github.com/{hmon.REPO}/releases/download/v0.2.5/install.sh')
         run.assert_called_once_with(['bash'], input=b'echo installing')
         self.assertEqual(done.exception.code, 0)
+        self.assertIn('Downloading the hmon 0.2.5 installer...', progress.getvalue())  # a slow step shows where it is
 
         with mock.patch.object(hmon, 'VERSION', '0.2.5'), \
                 mock.patch.object(hmon.urllib.request, 'urlopen', side_effect=github), \

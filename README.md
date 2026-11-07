@@ -2,7 +2,8 @@
 
 `hmon` is htop for the past. A small service records what every app, Docker container and process on a Linux host
 uses, and keeps it across reboots. When something crashes, open `hmon`, go back to just before it happened, and see
-what was eating memory or CPU. The newest column updates live, like htop.
+what was eating memory or CPU. The newest column is live: at 10 s and 1 min bars, like htop, it shows what runs
+now; longer bars keep their statistic, so today's peak stays in the table.
 
 ```
  CPU[|||||||||||||                          20.5%]    Tasks: 27 processes in 13 apps, 2 containers
@@ -64,7 +65,8 @@ is printed as it runs (`==> ...`).
   When a newer release is out, the viewer says so at the bottom right.
 - If journald keeps its log in memory (`Storage=volatile`, as with log2ram), the installer says so and moves on: the
   kernel's OOM reports then won't survive a reboot, though hmon's own samples do.
-- Remove: `... | sudo bash -s -- uninstall` (the data in `/var/lib/hmon` is left for you to delete).
+- Remove: `hmon uninstall` (it asks for sudo, then separately whether the recorded samples in `/var/lib/hmon` and
+  the settings go too; each stays unless you say yes). Without hmon: `... | sudo bash -s -- uninstall`.
 - From a clone: `sudo ./install.sh`. Without systemd: run `python3 hmon.py collect` from your init system
   (`HMON_DATA_DIR` and `HMON_INTERVAL` set where and how often).
 
@@ -89,6 +91,7 @@ is printed as it runs (`==> ...`).
 | `[` `]` | coarser / finer columns |
 | `s` | statistic |
 | Tab, Shift+Tab | graph memory, CPU, load or swap (Shift+Tab goes back) |
+| Space, Esc | a range of bars from the marker, stretched with Left / Right: the table shows each bar as a column (RES, or CPU% on the CPU graph; `-` where a process wasn't running); Esc goes back to one bar |
 | Up / Down, PgUp / PgDn, Home / End | select a row |
 | `+` / `-`, Enter, `*` | unfold / fold the selected app or container, toggle it, toggle everything |
 | F3 `/`, F4 `\` | search, filter (case-insensitive; `\|` separates terms) |
@@ -99,6 +102,7 @@ is printed as it runs (`==> ...`).
 
 The mouse acts when the button is released: click a row, a fold marker, a column title (again to reverse), a graph
 tab, a point on the graph, or a function-bar item; the wheel scrolls the table, or moves through time over the graph.
+Drag across the graph to pick a range of bars for the table, as Space does.
 
 **Copying text.** A terminal hands every click and drag to a program that uses the mouse, so it can't select text
 itself. hmon does the selecting instead: hold the button and drag, and what you drag over is highlighted and copied
@@ -108,8 +112,9 @@ set-clipboard on`) accept, and macOS Terminal doesn't. Where that doesn't work, 
 the mouse off in F2 Setup (saved) or for one run with `-M`, or hold **Shift** as you drag (Option in iTerm2; Fn in
 macOS Terminal).
 
-**Setup (F2).** Enter or a click opens a setting's dropdown, where typing filters the list (`kolk` finds
-`Asia/Kolkata` among the system's time zones, each shown with its UTC offset); Left/Right steps through the choices.
+**Setup (F2).** Enter or a click opens a setting's dropdown, where typing filters by anything a row shows: `kolk`,
+`ist` or `+05:30` all find `Asia/Kolkata` among the system's time zones, each shown with its UTC offset and
+abbreviation. Left/Right steps through the choices.
 Settings are saved to `~/.config/hmon/hmonrc`; `--tz` or `TZ` override the time zone for one run.
 
 The **Recording** section holds what the installer asked: how often to sample and how many days to keep, with the

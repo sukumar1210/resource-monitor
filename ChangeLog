@@ -1,3 +1,15 @@
+What's new in version 0.2.7
+
+* At 10 s and 1 min bars the live column shows what runs now, as htop does: a container stopped a moment ago is gone
+  at once, instead of lasting until its bar ends; longer bars keep their statistic, so today's peak stays findable
+* hmon uninstall removes hmon, and asks separately whether the recorded samples and the settings go too
+* A range of bars side by side: Space at one bar and Left / Right, or a drag across the graph, and the table shows
+  each bar as a column (RES, or CPU% on the CPU graph; '-' where a process wasn't running); Esc goes back to one bar
+* The mouse wheel scrolls down too where ncurses has its old mouse interface (no button 5), as on Amazon Linux 2
+* "New update available" stands out: black on yellow, set off from the key bar
+* hmon update says what it's doing before each step that waits on the network
+* Setup: the time zone list shows each zone's abbreviation, and typing matches it or the offset too (ist, +05:30)
+
 What's new in version 0.2.6
 
 * Shift+Tab cycles the graph tabs backwards

@@ -399,6 +399,7 @@ LIVE_HOST_SECONDS = 900  # the viewer's own live host samples kept for the graph
 LIVE_PROCESS_SECONDS = 60  # and its live process samples, which are much bigger
 SAMPLE_LIMIT = 240  # samples a column reads for the table at most, evenly spread; the graph stays exact
 COLUMN_CACHE = 64  # columns kept computed
+NOW_ZOOM = 60  # live bars this short show what runs now; longer ones keep their statistic, so a peak stays findable
 RELOAD_SECONDS = 30
 
 
@@ -749,6 +750,24 @@ def build_tree(column, sort_key, descending):
     return sorted(nodes, key=order, reverse=descending), app_labels
 
 
+def merge_columns(columns):
+    """One column with every process seen in any of `columns`; where several have one, the last column's values win."""
+    procs, apps, groups, pids = {}, {}, {}, {}
+    for column in columns:
+        procs.update(((p.pid, p.command), p) for p in column.procs)
+        apps.update(column.apps)
+        groups.update(column.groups)
+        pids.update(column.pids)
+    return columns[-1]._replace(procs=list(procs.values()), apps=apps, groups=groups, pids=pids)
+
+
+def bar_values(column):
+    """(memory, CPU) by table row key for one bar: its processes, apps and containers."""
+    values = {('process', p.pid, p.command): (p.mem, p.cpu) for p in column.procs}
+    values.update(column.groups)  # keyed ('app', name) and ('container', name), like their rows
+    return values
+
+
 def matches(pattern, *texts):
     """htop's search and filter test: case-insensitive substring, '|' separating alternatives; '' matches all."""
     terms = [term.strip().lower() for term in pattern.split('|') if term.strip()]
@@ -874,6 +893,12 @@ def row_segments(row, widths, mem_total, tree_mode):
     segments += [(' ', 'normal'), percent_segment(row.cpu, cpu_w), (' ', 'normal')]
     segments += [percent_segment(100 * row.mem / mem_total if row.mem is not None and mem_total else None, 4),
                  (' ', 'normal')]
+    return segments + name_segments(row, app_w, tree_mode)
+
+
+def name_segments(row, app_w, tree_mode):
+    """The end of a table row: the app column (list view), then the tree and the command or app."""
+    segments = []
     if not tree_mode:
         segments.append((f'{row.app[:app_w]:<{app_w}}  ', 'normal'))
     segments.append((row.tree, 'tree'))
@@ -885,6 +910,39 @@ def row_segments(row, widths, mem_total, tree_mode):
             detail += ', ' + plural(row.containers, 'container', 'containers')
         segments += [(row.label, 'app' if row.kind == 'app' else 'container'), (f'    {detail}', 'shadow')]
     return segments
+
+
+def bar_row_segments(row, widths, bars, cell_w, use_cpu, tree_mode):
+    """A row with bars side by side: PID, the row's RES (CPU% on the CPU graph) in each bar, '-' where it wasn't
+    running, then the app and command."""
+    pid_w, _, app_w = widths
+    segments = [(f' {row.pid:>{pid_w}}  ', 'normal')]
+    for values in bars:
+        pair = values.get(row.key)
+        value = None if pair is None else pair[1] if use_cpu else pair[0]
+        text = '-' if pair is None else 'N/A' if value is None else f'{value:.1f}' if use_cpu else human_unit(value / 1024)
+        segments.append((f'{text:>{cell_w - 1}} ', 'shadow' if value is None else 'normal'))
+    return segments + [(' ', 'normal')] + name_segments(row, app_w, tree_mode)
+
+
+def bar_header_segments(widths, labels, marked, cell_w, descending, tree_mode, glyphs):
+    """Titles with bars side by side as (text, style, bar start); the marker's bar, which orders the rows, gets the
+    sort arrow."""
+    pid_w, _, app_w = widths
+    arrow = glyphs['desc'] if descending else glyphs['asc']
+    segments = [(f' {"PID":>{pid_w}}  ', 'header', None)]
+    for start, text in labels:
+        segments.append((f'{text:>{cell_w - 1}}' + (arrow if start == marked else ' '),
+                         'sort' if start == marked else 'header', start))
+    segments.append((' ', 'header', None))
+    if not tree_mode:
+        segments.append((f'{"APP":<{app_w}}  ', 'header', None))
+    return segments + [('App / Process' if tree_mode else 'Command', 'header', None)]
+
+
+def bar_format(zoom):
+    """How a bar's time is written, under the graph and above its table column."""
+    return '%H:%M' if zoom < 900 else '%d %b %H:%M' if zoom < 86400 else '%d %b'
 
 
 def header_segments(widths, sort_key, descending, tree_mode, glyphs):
@@ -935,17 +993,19 @@ def set_zone(name):
 
 
 @lru_cache(maxsize=None)
-def zone_offset(name):
-    """'UTC+05:30' for a zone, as of now."""
+def zone_label(name):
+    """'UTC+05:30 IST' for a zone, as of now: its offset, then its abbreviation where it has a lettered one."""
     saved = os.environ.get('TZ')
     set_zone(name)
-    offset = time.localtime().tm_gmtoff
+    now = time.localtime()
+    offset, abbreviation = now.tm_gmtoff, time.strftime('%Z', now)
     if saved is None:
         os.environ.pop('TZ', None)
     else:
         os.environ['TZ'] = saved
     time.tzset()
-    return f'UTC{"+" if offset >= 0 else "-"}{abs(offset) // 3600:02d}:{abs(offset) % 3600 // 60:02d}'
+    text = f'UTC{"+" if offset >= 0 else "-"}{abs(offset) // 3600:02d}:{abs(offset) % 3600 // 60:02d}'
+    return text + (f' {abbreviation}' if abbreviation.isalpha() and abbreviation != 'UTC' else '')
 
 
 def recording():
@@ -1021,6 +1081,7 @@ class Viewer:
         self.regions, self.row_top, self.tree_x = [], 0, 0  # clickable areas of the last frame
         self.shown, self.pressed_at, self.dragged_to, self.held = {}, None, None, False
         self.update_available = False
+        self.anchor, self.bar_starts, self.graph_area = None, None, None  # a range of bars, from anchor to the marker
         self.glyphs = GLYPHS if unicode else ASCII_GLYPHS
         self.styles = self.make_styles(use_color and curses.has_colors())
         self.columns, self.graph_values = {}, {}  # caches, by column start and the settings that shape them
@@ -1033,7 +1094,7 @@ class Viewer:
         self.filter, self.mode, self.search, self.search_failed, self.notice = filter_text, None, '', False, ''
         self.index, self.selected, self.scroll, self.page = 0, None, 0, 10
         self.rows, self.width, self.graph_w, self.table_top, self.cursor_x = [], 80, 10, 0, 0
-        self.live_t, self.step = None, 1
+        self.live_t, self.step, self.live_cache = None, 1, (None, None)
         self.next_reload = time.monotonic() + RELOAD_SECONDS
         self.cursor = self.view_end = self.align(self.store.times[-1])
 
@@ -1046,7 +1107,8 @@ class Viewer:
                 pairs = [(curses.COLOR_CYAN, -1), (curses.COLOR_GREEN, -1), (curses.COLOR_RED, -1),
                          (curses.COLOR_BLACK, curses.COLOR_GREEN), (curses.COLOR_BLACK, curses.COLOR_CYAN),
                          (curses.COLOR_WHITE, -1), (curses.COLOR_YELLOW, -1), (curses.COLOR_BLACK, -1),
-                         (curses.COLOR_RED, curses.COLOR_CYAN), (curses.COLOR_BLUE, -1)]
+                         (curses.COLOR_RED, curses.COLOR_CYAN), (curses.COLOR_BLUE, -1),
+                         (curses.COLOR_BLACK, curses.COLOR_YELLOW)]
                 for pair, (fg, bg) in enumerate(pairs, start=1):
                     curses.init_pair(pair, fg, bg)
             except curses.error:
@@ -1056,12 +1118,14 @@ class Viewer:
             return dict(normal=0, shadow=curses.A_DIM, mega=0, giga=bold, large=bold, caption=0, value=bold,
                         bracket=bold, bar=0, swap=0, header=reverse, sort=reverse | bold, selected=reverse, tree=0,
                         app=bold, container=bold, graph=0, marker=bold, key=0, label=reverse, failed=reverse | bold,
-                        live=bold, tab=reverse)
-        cyan, green, red, header, selected, white, yellow, gray, failed, blue = (curses.color_pair(n) for n in range(1, 11))
+                        live=bold, tab=reverse, update=reverse | bold)
+        cyan, green, red, header, selected, white, yellow, gray, failed, blue, update = (curses.color_pair(n)
+                                                                                         for n in range(1, 12))
         return dict(normal=0, shadow=gray | bold, mega=cyan, giga=green, large=red | bold, caption=cyan,
                     value=cyan | bold, bracket=bold, bar=green, swap=red, header=header, sort=selected,
                     selected=selected, tree=cyan, app=bold, container=blue | bold, graph=cyan,
-                    marker=yellow | bold, key=white, label=selected, failed=failed, live=green | bold, tab=selected)
+                    marker=yellow | bold, key=white, label=selected, failed=failed, live=green | bold, tab=selected,
+                    update=update)
 
     def settings(self):
         return {'tz': self.tz, 'statistic': self.statistic, 'granularity': str(self.zoom), 'graph': self.metric,
@@ -1101,6 +1165,7 @@ class Viewer:
 
     def erase(self):
         self.screen.erase()
+        self.graph_area = None
         self.shown = {}  # what's on screen by (row, column), so a mouse drag can copy it
 
     def refresh(self):
@@ -1136,6 +1201,16 @@ class Viewer:
         return spans
 
     # ---- data
+
+    def column_at(self, start):
+        """A bar's column for the meters and the table. On a short live bar that's the newest live sample alone, so
+        they show what's running now, as htop does; other bars reduce their samples with the statistic."""
+        if self.live_t is not None and start <= self.live_t < start + self.zoom <= start + NOW_ZOOM:
+            if self.live_cache[0] != (self.live_t, self.statistic):
+                self.live_cache = ((self.live_t, self.statistic),
+                                   column_data(self.store, self.live_t, self.live_t + 1, self.statistic))
+            return self.live_cache[1]
+        return self.column(start)
 
     def column(self, start):
         key = (start, self.zoom, self.statistic)
@@ -1184,8 +1259,11 @@ class Viewer:
         first, last = self.align(self.store.times[0]), self.align(self.store.times[-1])
         self.cursor = min(max(self.align(self.cursor), first), last)
         self.view_end = min(max(self.align(self.view_end), self.cursor), self.cursor + (self.graph_w - 1) * self.zoom)
-        column = self.column(self.cursor)
+        column = self.column_at(self.cursor)
         self.step = column.step
+        self.bar_starts = self.bars()
+        if self.bar_starts:  # every process seen in the range, ordered by the marker's bar
+            column = merge_columns([self.column_at(start) for start in self.bar_starts if start != self.cursor] + [column])
         nodes, app_labels = build_tree(column, self.sort_key, self.descending)
         self.group_keys = {n.key for n in nodes} | {c.key for n in nodes for c in n.children if c.kind == 'container'}
         if self.tree:
@@ -1203,6 +1281,15 @@ class Viewer:
         self.draw_table(self.table_top, height - self.table_top - 1, width, column.host)
         self.draw_function_bar(height - 1, width)
         self.refresh()
+
+    def bars(self):
+        """The bars the table shows side by side, from the anchor to the marker: as many as fit, nearest the marker."""
+        if self.anchor is None:
+            return None
+        low, high = sorted((self.align(self.anchor), self.cursor))
+        starts = list(range(int(low), int(high) + 1, self.zoom))
+        fit = max(1, (self.width - 40) // (max(6, len(label(low, bar_format(self.zoom)))) + 2))
+        return starts[-fit:] if self.cursor == high else starts[:fit]
 
     def draw_meters(self, width, host, process_count, app_count, container_count):
         half = width // 2
@@ -1270,6 +1357,11 @@ class Viewer:
             x = self.put_segments(top, x, [(f' {metric} ', 'tab' if metric == self.metric else 'normal'), (' ', 'normal')])
             self.regions.append((top, top, tab_x, x - 1, lambda cx, cy, m=metric: self.set_metric(m)))
         thinned = f'; table reads 1 in {self.step} samples' if self.step > 1 else ''
+        low, high = sorted((self.align(self.anchor), self.cursor)) if self.anchor is not None else (None, None)
+        if low is not None:
+            count = (high - low) // self.zoom + 1
+            shown = f'{len(self.bar_starts)} of {count}' if len(self.bar_starts) < count else f'{count}'
+            thinned += f'; {shown} {"bar" if count == 1 else "bars"} in the table, Esc for one'
         self.put(top, x + 3, f'{self.statistic} per {ZOOM_NAMES[self.zoom]}, times in {label(self.cursor, "%Z")}{thinned}',
                  'shadow')
         starts = [self.view_end - (self.graph_w - 1 - col) * self.zoom for col in range(self.graph_w)]
@@ -1285,17 +1377,21 @@ class Viewer:
         self.put(axis, 1, f'{marks[2]:>4}' + g['corner'] + g['hline'] * self.graph_w)
         for row in range(top + 1, axis):
             self.put(row, 5, g['vert'])
-        self.regions.append((top + 1, axis + 1, 6, 6 + self.graph_w, lambda cx, cy: setattr(self, 'cursor', starts[cx - 6])))
-        time_format = '%H:%M' if self.zoom < 900 else '%d %b %H:%M' if self.zoom < 86400 else '%d %b'
+        self.regions.append((top + 1, axis + 1, 6, 6 + self.graph_w, lambda cx, cy: self.click_bar(starts[cx - 6])))
+        self.graph_area = (top + 1, axis, starts)
+        time_format = bar_format(self.zoom)
         for col, (start, value) in enumerate(zip(starts, values)):
             eighths = round(min(value, ceiling) / ceiling * graph_h * 8) if value is not None else 0
             is_marker = start == self.cursor
+            style = 'marker' if is_marker else 'selected' if low is not None and low <= start <= high else 'graph'
             for row in range(graph_h):
                 filled = eighths - (graph_h - 1 - row) * 8
                 char = g['bars'][7] if filled >= 8 else g['bars'][filled - 1] if filled > 0 else (g['vert'] if is_marker else ' ')
-                self.put(top + 1 + row, 6 + col, char, 'marker' if is_marker else 'graph')
+                self.put(top + 1 + row, 6 + col, char, style)
             if is_marker:
                 self.put(axis, 6 + col, g['marker'], 'marker')
+            elif style == 'selected':
+                self.put(axis, 6 + col, g['hline'], style)
             if (start + self.shift) % LABEL_EVERY[self.zoom] == 0:
                 self.put(axis + 1, 6 + col, label(start, time_format), 'shadow')
 
@@ -1304,12 +1400,25 @@ class Viewer:
         widths = (max([5] + [len(r.pid) for r in rows]),
                   max([5] + [len(f'{r.cpu:.1f}') for r in rows if r.cpu is not None]),
                   min(24, max([3] + [len(r.app) for r in rows])))
+        mem_total = host.mem_total if host else None
+        bars = self.bar_starts
+        if bars:  # one column per bar of the range: click a bar's title to order the rows by it
+            time_format = bar_format(self.zoom)
+            cell_w = max(6, len(label(bars[0], time_format))) + 2
+            header = bar_header_segments(widths, [(start, label(start, time_format)) for start in bars], self.cursor,
+                                         cell_w, self.descending, self.tree, self.glyphs)
+            values = [bar_values(self.column_at(start)) for start in bars]
+            segments_of = lambda row: bar_row_segments(row, widths, values, cell_w, self.metric == 'CPU', self.tree)
+        else:  # htop: click a column title to sort by it, again to reverse
+            header = header_segments(widths, self.sort_key, self.descending, self.tree, self.glyphs)
+            segments_of = lambda row: row_segments(row, widths, mem_total, self.tree)
         self.put(top, 0, ' ' * (width - 1), 'header')
         x = 0
-        for text, style, column in header_segments(widths, self.sort_key, self.descending, self.tree, self.glyphs):
+        for text, style, column in header:
             self.put(top, x, text, style)
-            if column:  # htop: click a column title to sort by it, again to reverse
-                self.regions.append((top, top, x, x + len(text), lambda cx, cy, c=column: self.click_header(c)))
+            if column is not None:
+                action = self.click_bar_title if bars else self.click_header
+                self.regions.append((top, top, x, x + len(text), lambda cx, cy, c=column, act=action: act(c)))
             x += len(text)
         self.tree_x = x - len('App / Process' if self.tree else 'Command')
 
@@ -1325,9 +1434,8 @@ class Viewer:
 
         self.row_top = top + 1
         self.regions.append((top + 1, top + visible, 0, width, self.click_row))
-        mem_total = host.mem_total if host else None
         for i, row in enumerate(rows[self.scroll:self.scroll + visible]):
-            segments = row_segments(row, widths, mem_total, self.tree)
+            segments = segments_of(row)
             if self.scroll + i == self.index:
                 self.put(top + 1 + i, 0, ''.join(text for text, _ in segments).ljust(width - 1), 'selected')
             else:
@@ -1354,12 +1462,13 @@ class Viewer:
             return
         update = ' New update available, Run: "hmon update" ' if self.update_available and prompt is None else ''
         right = width - 1 - len(update)  # the notice sits at the bottom right, and keys that would reach it make way
-        spans = self.put_keys(y, [(key, name) for key, name, _ in items], right - 1)
+        spans = self.put_keys(y, [(key, name) for key, name, _ in items], right - 3)
         for (x0, x1), (_, _, code) in zip(spans, items):
             if code is not None:
                 self.regions.append((y, y, x0, x1, lambda cx, cy, c=code: self.press(c)))
-        if update:
-            self.put(y, right, update, 'header')
+        if update:  # on yellow, set off from the bar by a gap
+            self.put(y, right - 2, '  ', 'normal')
+            self.put(y, right, update, 'update')
         if prompt is not None:
             x = self.put_segments(y, (spans[-1][1] if spans else 0) + 1, [(prompt, 'label')])
             self.put(y, x, text, 'failed' if self.mode == 'search' and self.search_failed else 'label')
@@ -1414,8 +1523,8 @@ class Viewer:
         self.erase()
         self.put(0, 1, f'hmon {VERSION} - htop for the past: what every app, container and process used, over time',
                  'value')
-        self.put(1, 1, 'Meters and the table show the chosen statistic over the column under the marker; the newest '
-                       'column is live.', 'value')
+        self.put(1, 1, 'Meters and the table show the chosen statistic over the column under the marker; on the '
+                       'newest column at 10 s or 1 min, what runs now.', 'value')
         self.put_segments(3, 1, [('CPU ', 'caption'), ('[', 'bracket'), ('used%', 'bar'), (']   ', 'bracket'),
                                  ('Mem ', 'caption'), ('[', 'bracket'), ('used/total', 'bar'), (']   ', 'bracket'),
                                  ('Swp ', 'caption'), ('[', 'bracket'), ('used/total', 'swap'), (']', 'bracket')])
@@ -1426,7 +1535,8 @@ class Viewer:
         left = [(g['left_right'], 'move the marker one column'), ('S-' + g['left_right'], 'move a screen width'),
                 ('^ ^A', 'oldest sample'), ('$ ^E', 'newest sample (live)'), ('g', 'go to 12/10/2026 14:30 IST'),
                 ('[ ]', 'coarser / finer: 10 s .. 1 day'), ('s', 'statistic: avg max min p50/90/99'),
-                ('Tab S-Tab', 'graph: memory, CPU, load, swap'), ('F2', 'setup: zone, defaults, recording')]
+                ('Tab S-Tab', 'graph: memory, CPU, load, swap'), ('Space', 'a range of bars, a table column each'),
+                ('Esc', 'back to one bar'), ('F2', 'setup: zone, defaults, recording')]
         right = [(g['up_down'], 'select a row'), ('PgUp PgDn', 'page through the rows'), ('Home End', 'first / last row'),
                  ('+ -', 'unfold / fold the selected app'), ('Enter', 'unfold or fold it'),
                  ('* c', 'fold / unfold everything'),
@@ -1465,7 +1575,7 @@ class Viewer:
             return megabytes_per_day(interval, self.process_count)
 
         if name == 'Time zone':
-            return time_zones(), self.tz, str, lambda z: f'{z:<34}{zone_offset(z)}'
+            return time_zones(), self.tz, str, lambda z: f'{z:<34}{zone_label(z)}'
         if name == 'Statistic':
             return STATISTICS, self.statistic, str, str
         if name == 'Granularity':
@@ -1492,7 +1602,7 @@ class Viewer:
         if name in ('Sample every', 'Keep') and current is None:
             return 'the hmon service is not installed here'
         if name == 'Time zone':
-            return f'{self.tz}   ({zone_offset(self.tz)})'
+            return f'{self.tz}   ({zone_label(self.tz)})'
         if name == 'Mouse':
             return self.mouse_text(current)
         if name == 'Sample every':
@@ -1523,15 +1633,16 @@ class Viewer:
         else:
             self.recording[1] = value
 
-    def choose(self, y, x, title, options, current, name=str, describe=str, backdrop=None):
+    def choose(self, y, x, title, options, current, describe=str, backdrop=None):
         """A dropdown at (y, x) over what `backdrop()` draws: arrows, PgUp/PgDn, Home/End or the wheel move, typing
-        filters by name, Enter or a click picks, Esc or a click outside cancels. Returns the pick, or None."""
+        filters by anything a row shows (a zone's name, offset or abbreviation: kolk, +05:30 or ist), Enter or a click
+        picks, Esc or a click outside cancels. Returns the pick, or None."""
         query, index, top = '', options.index(current) if current in options else 0, 0
         while True:
             if backdrop:
                 backdrop()  # repainted each time, so a list that shrinks while filtering uncovers the screen
             height, width = self.screen.getmaxyx()
-            shown = [option for option in options if query.lower() in name(option).lower()]
+            shown = [option for option in options if query.lower() in describe(option).lower()]
             rows = max(1, min(len(shown), height - y - 3))
             box = min(width - x - 1, max([len(title) + 24] + [len(describe(o)) + 3 for o in shown]))
             index = min(max(index, 0), max(0, len(shown) - 1))
@@ -1627,10 +1738,10 @@ class Viewer:
             elif key in (27, ord('q'), curses.KEY_F2, curses.KEY_F10):
                 break
             if pick:
-                options, current, short, describe = self.setting_options(names[choice])
+                options, current, _, describe = self.setting_options(names[choice])
                 if options:
-                    value = self.choose(self.setting_row(choice) + 1, 18, names[choice], options, current, short,
-                                        describe, draw)
+                    value = self.choose(self.setting_row(choice) + 1, 18, names[choice], options, current, describe,
+                                        draw)
                     if value is not None:
                         self.apply_setting(names[choice], value)
         notices = []
@@ -1774,6 +1885,8 @@ class Viewer:
         if state & getattr(curses, 'BUTTON5_PRESSED', 0):  # missing from older ncurses builds
             return MouseEvent('wheel', x, y, 1)
         if state & curses.REPORT_MOUSE_POSITION:
+            if not self.pressed_at and not hasattr(curses, 'BUTTON5_PRESSED'):
+                return MouseEvent('wheel', x, y, 1)  # how ncurses' old mouse ABI (no button 5) reports the wheel down
             if self.pressed_at:
                 old = set(self.selection(self.pressed_at, self.dragged_to)) if self.dragged_to else set()
                 self.dragged_to = (x, y)
@@ -1791,7 +1904,10 @@ class Viewer:
             if dragged:
                 self.paint(self.selection(start, dragged), 0)
             if start and start != (x, y):
-                self.copy_text(self.selection(start, (x, y)))
+                if self.on_graph(start):
+                    self.anchor, self.cursor = self.bar_at(start[0]), self.bar_at(x)
+                else:
+                    self.copy_text(self.selection(start, (x, y)))
                 return None
             return MouseEvent('click', x, y, 0)
         if state & curses.BUTTON1_CLICKED:
@@ -1800,10 +1916,25 @@ class Viewer:
 
     def selection(self, start, end):
         """The cells from one (x, y) to another in reading order, line by line as a terminal selects text."""
+        if self.on_graph(start):  # a drag that starts on the graph picks bars: whole columns of it, not text
+            top, axis, starts = self.graph_area
+            x0, x1 = sorted(min(max(x, 6), 5 + len(starts)) for x in (start[0], end[0]))
+            return [(y, x) for y in range(top, axis + 1) for x in range(x0, x1 + 1)]
         (x0, y0), (x1, y1) = sorted([start, end], key=lambda cell: (cell[1], cell[0]))
         last = self.screen.getmaxyx()[1] - 2  # put() never writes the last column
         return [(y, x) for y in range(y0, y1 + 1)
                 for x in range(x0 if y == y0 else 0, min(x1 if y == y1 else last, last) + 1)]
+
+    def on_graph(self, cell):
+        if self.graph_area is None:
+            return False
+        top, axis, starts = self.graph_area
+        return top <= cell[1] <= axis and 6 <= cell[0] < 6 + len(starts)
+
+    def bar_at(self, x):
+        """The start of the graph's bar in screen column `x`, or of the nearest one at either end."""
+        starts = self.graph_area[2]
+        return starts[min(max(x - 6, 0), len(starts) - 1)]
 
     def paint(self, cells, attr):
         """Redraws `cells` as they were put, with `attr` added: A_REVERSE shows a selection, 0 takes it down."""
@@ -1852,6 +1983,12 @@ class Viewer:
             self.edit(key)
             return True
         return self.handle(key)
+
+    def click_bar(self, start):
+        self.cursor, self.anchor = start, None
+
+    def click_bar_title(self, start):
+        self.cursor = start
 
     def click_header(self, column):
         if column == self.sort_key:
@@ -1936,6 +2073,10 @@ class Viewer:
             self.cursor = self.store.times[0]
         elif char in ('$', '\x05'):
             self.cursor = self.store.times[-1]
+        elif char == ' ':  # a range of bars from here, which the marker's moves stretch
+            self.anchor = None if self.anchor is not None else self.cursor
+        elif key == 27:
+            self.anchor = None
         elif char == 'g':
             self.go_to()
         elif char in ('[', ']'):
@@ -2129,8 +2270,59 @@ def is_newer(version):
         return False
 
 
+INSTALLED_FILES = ['/etc/systemd/system/hmon.service', '/etc/systemd/system/hmon-events.service', '/usr/local/bin/hmon',
+                   '/etc/tmpfiles.d/hmon.conf', '/etc/systemd/journald.conf.d/hmon.conf']  # what install.sh puts in place
+
+
+def as_root(command):
+    """Runs `hmon COMMAND` again under sudo; it doesn't return."""
+    try:
+        os.execvp('sudo', ['sudo', sys.executable, os.path.abspath(sys.argv[0]), command])
+    except OSError:
+        sys.exit(f'sudo is missing here; run `hmon {command}` as root.')
+
+
+def confirm(question):
+    """A yes/no question at the terminal; anything but yes, or no terminal to answer from, is no."""
+    try:
+        return input(f'{question} [y/N] ').strip().lower() in ('y', 'yes')
+    except EOFError:
+        return False
+
+
+def uninstall():
+    """Stops and removes the hmon services, the command and the installer's system files; asks separately whether
+    the recorded samples and the settings go too, each kept unless the answer is yes."""
+    if os.geteuid() != 0:
+        as_root('uninstall')
+    configs = {os.path.dirname(CONFIG_PATH)}
+    if os.environ.get('SUDO_USER'):  # the settings of whoever ran `hmon uninstall`, not just root's
+        configs.add(os.path.join(os.path.expanduser('~' + os.environ['SUDO_USER']), '.config', 'hmon'))
+    samples = [DATA_DIR] if os.path.exists(DATA_DIR) else []
+    settings = [path for path in sorted(configs) if os.path.exists(path)]
+    deleted = []
+    if samples:
+        size = sum(os.path.getsize(os.path.join(folder, name)) for folder, _, names in os.walk(DATA_DIR) for name in names)
+        if confirm(f'Delete the recorded samples in {DATA_DIR} ({size / 1e6:.0f} MB)?'):
+            deleted += samples
+    if settings and confirm(f'Delete the settings in {", ".join(settings)}?'):
+        deleted += settings
+    for unit in ('hmon', 'hmon-events'):
+        subprocess.run(['systemctl', 'disable', '--now', unit], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    for path in INSTALLED_FILES:
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(path)
+    subprocess.run(['systemctl', 'daemon-reload'])
+    for path in deleted:
+        shutil.rmtree(path, ignore_errors=True)
+    kept = [path for path in samples + settings if path not in deleted]
+    print('hmon removed.' + (f' Deleted {", ".join(deleted)}.' if deleted else '') + (f' Kept {", ".join(kept)}.' if kept else ''))
+
+
 def update():
-    """Runs the newest release's installer, which keeps the sampling interval and retention already set."""
+    """Runs the newest release's installer, which keeps the sampling interval and retention already set. Says what
+    it's doing before each step that waits on the network, so a slow one shows where it is."""
+    print('Checking GitHub for a newer hmon...', flush=True)
     newest = newest_release(timeout=15)
     if newest is None:
         sys.exit(f'Could not reach GitHub to look up the newest release of {REPO}.')
@@ -2138,16 +2330,16 @@ def update():
         print(f'hmon {VERSION} is up to date.')
         return
     if os.geteuid() != 0:  # the installer replaces /usr/local/bin/hmon and restarts the service
-        try:
-            os.execvp('sudo', ['sudo', sys.executable, os.path.abspath(sys.argv[0]), 'update'])
-        except OSError:
-            sys.exit(f'hmon {newest} is out; updating needs root, so run `hmon update` as root.')
+        print(f'hmon {newest} is out (this is {VERSION}); updating needs sudo.', flush=True)
+        as_root('update')
     url = f'https://github.com/{REPO}/releases/download/v{newest}/install.sh'
+    print(f'Downloading the hmon {newest} installer...', flush=True)
     try:
         with urllib.request.urlopen(url, timeout=120) as reply:
             installer = reply.read()
     except OSError as error:
         sys.exit(f'Could not download {url}: {error}')
+    print(f'Updating hmon {VERSION} to {newest}:', flush=True)
     sys.exit(subprocess.run(['bash'], input=installer).returncode)
 
 
@@ -2160,6 +2352,7 @@ def main(argv):
               '       %(prog)s [options] sql "SELECT ..." [--from TIME] [--to TIME] [SOURCE]\n'
               '       %(prog)s configure [--interval SECONDS] [--retention DAYS]\n'
               '       %(prog)s update\n'
+              '       %(prog)s uninstall\n'
               '       %(prog)s collect',
         description=f'hmon {VERSION} - htop for the past: what every app, container and process used, over time, '
                     'recorded by the hmon service and browsed here.',
@@ -2220,6 +2413,8 @@ def main(argv):
         collect()
     elif words == ['update']:
         update()
+    elif words == ['uninstall']:
+        uninstall()
     elif words == ['configure']:
         interval, days = recording()
         if interval is None:
