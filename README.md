@@ -27,7 +27,7 @@ what was eating memory or CPU. The newest column updates live, like htop.
  942377  11264    0.0   0.1  └─ /usr/bin/containerd-shim-runc-v2 -namespace moby -id 7526c2cf3b57
           330M    0.0   2.8  + market-recorder    1 process
           180M    0.0   1.5  + actions.runner.homelab    2 processes
-F1Help  F2Setup F3SearchF4FilterF5List  F6SortByF10Quit  ←→Time  []Zoom  sStat  gGoTo  TabGraph
+F1Help  F2Setup F3Search F4Filter F5List  F6SortBy F10Quit  ← / →Time  [ / ]Zoom  sStat  gGoTo  TabGraph
 ```
 
 (A real screen on demo data, trimmed to fit: `docker` unfolded, its containers folded. Memory figures are htop's:

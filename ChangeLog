@@ -1,3 +1,9 @@
+What's new in version 0.2.4
+
+* Dragging keeps up with the mouse: while the button is held only the highlight is repainted, not the whole screen,
+  so the selection follows the pointer and the copy happens as soon as you let go
+* Key pairs read apart in the function bar and help: [ / ] and ← / → instead of [] and ←→
+
 What's new in version 0.2.3
 
 * Dragging selects text: what you drag over is highlighted and copied to the clipboard when you let go (OSC 52), and

@@ -804,9 +804,9 @@ UNIT_PREFIXES = 'KMGTPEZYRQ'
 SORT_COLUMNS = {'PID': False, 'RES': True, 'CPU%': True, 'MEM%': True}  # column -> descending by default, as in htop
 BLOCKS = '▁▂▃▄▅▆▇█'
 GLYPHS = dict(bars=BLOCKS, vert='│', hline='─', corner='└', marker='▲', tee='├', bend='└', open='+', shut='─',
-              asc='△', desc='▽', left_right='←→', up_down='↑↓')
+              asc='△', desc='▽', left_right='← / →', up_down='↑ / ↓')
 ASCII_GLYPHS = dict(bars='.:-=+*#@', vert='|', hline='-', corner='+', marker='^', tee='`', bend='`', open='+',
-                    shut='-', asc='+', desc='-', left_right='Lt/Rt', up_down='Up/Dn')
+                    shut='-', asc='+', desc='-', left_right='Lt / Rt', up_down='Up / Dn')
 
 
 def kbytes_segments(kib):
@@ -1015,7 +1015,7 @@ class Viewer:
         self.screen, self.store, self.sampler = screen, store, sampler
         self.mouse, self.mouse_on = mouse, settings.get('mouse', 'on') == 'on'  # -M turns it off for this run only
         self.regions, self.row_top, self.tree_x = [], 0, 0  # clickable areas of the last frame
-        self.shown, self.pressed_at, self.dragged_to = {}, None, None
+        self.shown, self.pressed_at, self.dragged_to, self.held = {}, None, None, False
         self.glyphs = GLYPHS if unicode else ASCII_GLYPHS
         self.styles = self.make_styles(use_color and curses.has_colors())
         self.columns, self.graph_values = {}, {}  # caches, by column start and the settings that shape them
@@ -1327,7 +1327,7 @@ class Viewer:
             items = [('F1', 'Help  ', curses.KEY_F1), ('F2', 'Setup ', curses.KEY_F2), ('F3', 'Search', curses.KEY_F3),
                      ('F4', 'FILTER' if self.filter else 'Filter', curses.KEY_F4),
                      ('F5', 'List  ' if self.tree else 'Tree  ', curses.KEY_F5), ('F6', 'SortBy', curses.KEY_F6),
-                     ('F10', 'Quit  ', curses.KEY_F10), (g['left_right'], 'Time  ', None), ('[]', 'Zoom  ', ord('[')),
+                     ('F10', 'Quit  ', curses.KEY_F10), (g['left_right'], 'Time  ', None), ('[ / ]', 'Zoom  ', ord('[')),
                      ('s', 'Stat  ', ord('s')), ('g', 'GoTo  ', ord('g')), ('Tab', 'Graph ', ord('\t'))]
             prompt = text = None
         self.put(y, 0, ' ' * (width - 1), 'label')
@@ -1756,10 +1756,12 @@ class Viewer:
             return MouseEvent('wheel', x, y, 1)
         if state & curses.REPORT_MOUSE_POSITION:
             if self.pressed_at:
-                if self.dragged_to:
-                    self.paint(self.selection(self.pressed_at, self.dragged_to), 0)
+                old = set(self.selection(self.pressed_at, self.dragged_to)) if self.dragged_to else set()
                 self.dragged_to = (x, y)
-                self.refresh()
+                new = set(self.selection(self.pressed_at, self.dragged_to))
+                self.paint(old - new, 0)  # only the cells that changed, so a long drag keeps up with the mouse
+                self.paint(new - old, curses.A_REVERSE)
+                self.screen.refresh()
             return None
         if state & curses.BUTTON1_PRESSED:
             self.pressed_at, self.dragged_to = (x, y), None
@@ -1811,6 +1813,7 @@ class Viewer:
         """A click runs whatever was drawn under it; the wheel scrolls the table, or moves in time over the graph.
         Returns False to quit (a click on F10)."""
         event = self.mouse_event()
+        self.held = not event and self.pressed_at is not None  # a press or a drag in the main view
         if not event:
             return True
         if event.kind == 'wheel':
@@ -1946,7 +1949,9 @@ class Viewer:
         self.apply_mouse()
         self.tick()
         while True:
-            self.draw()
+            if not self.held:  # mid-drag only the highlight changes, and mouse_event has painted it
+                self.draw()
+            self.held = False
             if self.mode:
                 self.show_cursor(1)
                 self.screen.move(self.screen.getmaxyx()[0] - 1, min(self.cursor_x, self.width - 2))
