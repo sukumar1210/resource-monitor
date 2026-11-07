@@ -202,7 +202,8 @@ class EndToEnd(unittest.TestCase):
 
         header_click = (0, 10, 19, 0, hmon.curses.BUTTON1_RELEASED)  # the RES title of the table header
         go_to = [ord(c) for c in '6/11/2026 08:44 IST'] + [10]
-        keys = ([ord('g')] + go_to + [ord('['), ord('['), ord('s'), ord('\t'), ord('\t'), ord('\\')]
+        keys = ([ord('g')] + go_to + [ord('['), ord('['), ord('s'), ord('\t'), ord('\t'), ord('\t'), hmon.curses.KEY_BTAB,
+                                      ord('\\')]
                 + [ord(c) for c in 'leak'] + [10, ord('\\'), 27, hmon.curses.KEY_MOUSE, hmon.curses.KEY_F2, 10]
                 + [ord(c) for c in 'kolk'] + [10, 27])
         frames = browse(data_dir, keys, sampler=Live(), clicks=[header_click])
@@ -218,17 +219,19 @@ class EndToEnd(unittest.TestCase):
         self.assertIn(' 240M ', next(line for line in frames[4].split('\n') if '+ leak' in line))
         graph_top = frames[6].split('\n')[5]
         self.assertTrue(graph_top.startswith('    2'), graph_top)  # Load is scaled to its peak, not to 100%
-        filtered = frames[12]
+        self.assertNotEqual(frames[7].split('\n')[5], graph_top)  # Tab again: Swap
+        self.assertEqual(frames[8].split('\n')[5], graph_top)  # Shift+Tab: back to Load
+        filtered = frames[14]
         self.assertIn('/opt/leak/bin/leak --serve', filtered)
         self.assertNotIn('openalgo', filtered)
-        self.assertIn('+ docker', frames[14])  # Esc in the filter bar clears it; apps are folded again
-        self.assertIn('RES▽', frames[15])  # a click on a column title sorts by it
-        self.assertIn('F2 Setup  F3 Search  F4 Filter', frames[15])  # each key apart from its label and the next
-        self.assertIn('Time zone (type to filter)', frames[17].replace('   ', ' '))  # Enter opens a dropdown
-        zones = frames[21]
+        self.assertIn('+ docker', frames[16])  # Esc in the filter bar clears it; apps are folded again
+        self.assertIn('RES▽', frames[17])  # a click on a column title sorts by it
+        self.assertIn('F2 Setup  F3 Search  F4 Filter', frames[17])  # each key apart from its label and the next
+        self.assertIn('Time zone (type to filter)', frames[19].replace('   ', ' '))  # Enter opens a dropdown
+        zones = frames[23]
         self.assertIn('Time zone: kolk', zones)
         self.assertRegex(zones, r'Asia/Kolkata\s+UTC\+05:30')
-        self.assertIn('times in IST', frames[23])
+        self.assertIn('times in IST', frames[25])
         with open(hmon.CONFIG_PATH) as f:
             self.assertIn('tz=Asia/Kolkata', f.read())
 

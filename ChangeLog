@@ -1,3 +1,7 @@
+What's new in version 0.2.6
+
+* Shift+Tab cycles the graph tabs backwards
+
 What's new in version 0.2.5
 
 * hmon update installs the newest release (asking for sudo), keeping the interval and retention already set

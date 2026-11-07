@@ -1426,7 +1426,7 @@ class Viewer:
         left = [(g['left_right'], 'move the marker one column'), ('S-' + g['left_right'], 'move a screen width'),
                 ('^ ^A', 'oldest sample'), ('$ ^E', 'newest sample (live)'), ('g', 'go to 12/10/2026 14:30 IST'),
                 ('[ ]', 'coarser / finer: 10 s .. 1 day'), ('s', 'statistic: avg max min p50/90/99'),
-                ('Tab', 'graph: memory, CPU, load, swap'), ('F2', 'setup: zone, defaults, recording')]
+                ('Tab S-Tab', 'graph: memory, CPU, load, swap'), ('F2', 'setup: zone, defaults, recording')]
         right = [(g['up_down'], 'select a row'), ('PgUp PgDn', 'page through the rows'), ('Home End', 'first / last row'),
                  ('+ -', 'unfold / fold the selected app'), ('Enter', 'unfold or fold it'),
                  ('* c', 'fold / unfold everything'),
@@ -1918,8 +1918,8 @@ class Viewer:
             self.set_sort({'M': 'MEM%', 'P': 'CPU%', 'N': 'PID'}[char])
         elif char == 'I':
             self.descending = not self.descending
-        elif char == '\t':
-            self.set_metric(cycle(METRICS, self.metric, 1))
+        elif char == '\t' or key == curses.KEY_BTAB:  # Shift+Tab goes the other way
+            self.set_metric(cycle(METRICS, self.metric, 1 if char == '\t' else -1))
         elif key == curses.KEY_MOUSE:
             return self.click()
         elif char == 's':

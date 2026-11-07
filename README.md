@@ -88,7 +88,7 @@ is printed as it runs (`==> ...`).
 | `g` | go to a time: `12/10/2026 14:30 IST`, `2 Feb 2025 UTC`, `Oct 12 2026 2:30 pm`, `14:30` (dates are day first); Esc or a click cancels |
 | `[` `]` | coarser / finer columns |
 | `s` | statistic |
-| Tab | graph memory, CPU, load or swap |
+| Tab, Shift+Tab | graph memory, CPU, load or swap (Shift+Tab goes back) |
 | Up / Down, PgUp / PgDn, Home / End | select a row |
 | `+` / `-`, Enter, `*` | unfold / fold the selected app or container, toggle it, toggle everything |
 | F3 `/`, F4 `\` | search, filter (case-insensitive; `\|` separates terms) |
