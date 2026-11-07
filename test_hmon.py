@@ -323,18 +323,21 @@ class EndToEnd(unittest.TestCase):
             self.assertNotEqual(times[1], times[0])  # up: a column back
             self.assertEqual(times[2], times[0])  # down: forward again
 
-    def test_the_graph_stays_where_old_mouse_reports_reach(self):
+    def test_sgr_mouse_reports_where_ncurses_reads_only_x10(self):
         data_dir = self.history()
         c = hmon.curses
-        screen = FakeScreen([c.KEY_MOUSE] * 2, cols=300)  # a wide terminal, whose mouse reports are X10 (\E[M)
-        click = [(0, 200, 8, 0, c.BUTTON1_PRESSED), (0, 200, 8, 0, c.BUTTON1_RELEASED)]
+        keys = [27] + [ord(ch) for ch in '[<0;201;9M'] + [27] + [ord(ch) for ch in '[<0;201;9m'] + [27, ord('t')]
+        screen = FakeScreen(keys, cols=300)  # a wide terminal whose terminfo knows only X10 reports (\E[M), so
+        terminal = io.StringIO()  # ncurses passes SGR ones on as keys: a click at column 200, then Esc and t
         with mock.patch.object(c, 'mousemask'), mock.patch.object(c, 'mouseinterval'), \
                 mock.patch.object(c, 'tigetstr', return_value=b'\x1b[M'), \
-                mock.patch.object(c, 'getmouse', side_effect=click), contextlib.redirect_stdout(io.StringIO()):
+                mock.patch.object(c, 'ungetch', side_effect=lambda key: screen.keys.insert(0, key)), \
+                contextlib.redirect_stdout(terminal):
             hmon.Viewer(screen, hmon.Store(data_dir), dict(hmon.DEFAULTS, tz='UTC'), None, use_color=False).run()
-        axis = screen.frames[0].split('\n')[16]
-        self.assertLessEqual(len(axis.rstrip()), hmon.X10_COLUMNS)  # every bar sits where a click can say it
-        self.assertEqual(screen.frames[2].split('\n')[16].find('▲'), 200)  # and a click near its right end lands there
+        self.assertIn('\x1b[?1006h', terminal.getvalue())  # hmon asked for SGR reports
+        clicked = next(f for f in screen.frames if f.split('\n')[16].find('▲') == 200)  # the marker went to column 200
+        self.assertGreater(len(clicked.split('\n')[16].rstrip()), 223)  # on a graph as wide as the screen
+        self.assertIn('Command', screen.frames[-1])  # Esc, then t (list view): keys that aren't a report still work
 
     def test_mouse_clicks_act_on_release(self):
         data_dir = self.history()

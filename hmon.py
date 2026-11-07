@@ -399,7 +399,7 @@ LIVE_HOST_SECONDS = 900  # the viewer's own live host samples kept for the graph
 LIVE_PROCESS_SECONDS = 60  # and its live process samples, which are much bigger
 SAMPLE_LIMIT = 240  # samples a column reads for the table at most, evenly spread; the graph stays exact
 COLUMN_CACHE = 64  # columns kept computed
-X10_COLUMNS = 223  # the old mouse reports (X10) carry a column in one byte, so a click can't say one past this
+SGR_REPORT = re.compile(r'\[<(\d+);(\d+);(\d+)([Mm])')  # an SGR mouse report, after its ESC: button, column, row
 NOW_ZOOM = 60  # live bars this short show what runs now; longer ones keep their statistic, so a peak stays findable
 RELOAD_SECONDS = 30
 
@@ -695,6 +695,17 @@ def app_of(proc, by_pid):
 Node = namedtuple('Node', 'kind key label pid mem cpu count children')
 TableRow = namedtuple('TableRow', 'key kind pid label mem cpu count containers tree has_children is_open group app')
 MouseEvent = namedtuple('MouseEvent', 'kind x y step')  # kind: click or wheel; step: -1 up, 1 down
+
+
+def sgr_state(button, final):
+    """The ncurses button state for an SGR mouse report: its button code, and M (press, drag, wheel) or m (release)."""
+    if button & 64:  # the wheel: 64 up, 65 down; where ncurses has no button 5 it reports down as a move
+        return curses.BUTTON4_PRESSED if button & 1 == 0 else getattr(curses, 'BUTTON5_PRESSED', curses.REPORT_MOUSE_POSITION)
+    if button & 32:  # moved with a button held
+        return curses.REPORT_MOUSE_POSITION
+    if button & 3:  # the middle or right button
+        return 0
+    return curses.BUTTON1_PRESSED if final == 'M' else curses.BUTTON1_RELEASED
 
 
 def sort_value(sort_key):
@@ -1082,7 +1093,7 @@ class Viewer:
         self.regions, self.row_top, self.tree_x = [], 0, 0  # clickable areas of the last frame
         self.shown, self.pressed_at, self.dragged_to, self.held = {}, None, None, False
         self.update_available = False
-        self.mouse_reach = None  # the last column a click can say, where the terminal reports the mouse the old way
+        self.own_sgr, self.sgr_event, self.blocked = False, None, False  # SGR mouse reports hmon reads itself
         self.anchor, self.bar_starts, self.graph_area = None, None, None  # a range of bars, from anchor to the marker
         self.glyphs = GLYPHS if unicode else ASCII_GLYPHS
         self.styles = self.make_styles(use_color and curses.has_colors())
@@ -1141,12 +1152,13 @@ class Viewer:
         try:
             curses.mousemask(curses.ALL_MOUSE_EVENTS | curses.REPORT_MOUSE_POSITION if on else 0)
             curses.mouseinterval(0)  # report presses at once instead of waiting to tell clicks from double-clicks
-            self.screen.refresh()  # ncurses' own mouse switch goes out first, or it would undo the next line
-            sys.stdout.write('\033[?1002h' if on else '\033[?1002l')  # report drags too, so hmon can select text
-            sys.stdout.flush()
+            self.screen.refresh()  # ncurses' own mouse switch goes out first, or it would undo what follows
             sgr = ((curses.tigetstr('kmous') or b'').startswith(b'\033[<')
-                   or b'1006' in (curses.tigetstr('XM') or b''))  # the terminfo says how ncurses asks for reports
-            self.mouse_reach = None if sgr or not on else X10_COLUMNS
+                   or b'1006' in (curses.tigetstr('XM') or b''))  # the terminfo says which reports ncurses reads
+            self.own_sgr = bool(on and not sgr)  # X10 reports carry a column in one byte: none past 223
+            # report drags too, so hmon can select text; and where ncurses reads only X10, SGR reports for hmon to read
+            sys.stdout.write(('\033[?1002h' + ('\033[?1006h' if self.own_sgr else '')) if on else '\033[?1002l\033[?1006l')
+            sys.stdout.flush()
         except curses.error:
             pass
 
@@ -1260,8 +1272,7 @@ class Viewer:
 
     def draw(self):
         height, width = self.screen.getmaxyx()
-        self.width = width
-        self.graph_w = max(10, min(width, self.mouse_reach or width) - 8)  # every bar where a click can reach it
+        self.width, self.graph_w = width, max(10, width - 8)
         first, last = self.align(self.store.times[0]), self.align(self.store.times[-1])
         self.cursor = min(max(self.align(self.cursor), first), last)
         self.view_end = min(max(self.align(self.view_end), self.cursor), self.cursor + (self.graph_w - 1) * self.zoom)
@@ -1483,7 +1494,36 @@ class Viewer:
     # ---- dialogs
 
     def blocking(self, on):
+        self.blocked = on
         self.screen.timeout(-1 if on else self.delay * 100)
+
+    def getch(self):
+        """The next key. Where hmon reads SGR mouse reports itself (own_sgr), ncurses passes one on as keys,
+        ESC [ < button ; column ; row M; it comes back as KEY_MOUSE, like ncurses' own, and anything else after an ESC
+        is put back."""
+        key = self.screen.getch()
+        if key != 27 or not self.own_sgr:
+            return key
+        chars = []
+        self.screen.timeout(50)  # the rest of a report is on its way, if this ESC began one
+        try:
+            while len(chars) < 20:
+                char = self.screen.getch()
+                if char == -1:
+                    break
+                chars.append(char)
+                if chars[:2] != [ord('['), ord('<')][:len(chars)] or chr(char) in 'Mm':
+                    break
+        finally:
+            self.blocking(self.blocked)
+        match = SGR_REPORT.fullmatch(''.join(map(chr, chars)))
+        if not match:
+            for char in reversed(chars):
+                curses.ungetch(char)
+            return key
+        button, column, row, final = match.groups()
+        self.sgr_event = (int(column) - 1, int(row) - 1, sgr_state(int(button), final))
+        return curses.KEY_MOUSE
 
     def show_cursor(self, visible):
         try:
@@ -1503,7 +1543,7 @@ class Viewer:
                 self.put(y, 0, (question + text).ljust(width - 1), 'label')
                 self.screen.move(y, min(len(question) + len(text), width - 2))
                 self.refresh()
-                key = self.screen.getch()
+                key = self.getch()
                 if key in (10, 13, curses.KEY_ENTER):
                     return text.strip()
                 if key == 27:
@@ -1556,7 +1596,7 @@ class Viewer:
         height = self.screen.getmaxyx()[0]
         self.put(height - 1, 1, 'Press any key or click to return.', 'normal')
         self.refresh()
-        while self.screen.getch() == curses.KEY_MOUSE and not self.mouse_event():
+        while self.getch() == curses.KEY_MOUSE and not self.mouse_event():
             pass  # the release of the click that opened help, or a press: wait for a whole click or a key
         self.blocking(False)
 
@@ -1662,7 +1702,7 @@ class Viewer:
             end = self.put_keys(height - 1, [('Enter', 'Pick'), ('Esc', 'Cancel')])[-1][1]
             self.put(height - 1, end + 2, 'type to filter', 'label')
             self.refresh()
-            key = self.screen.getch()
+            key = self.getch()
             if key in (curses.KEY_UP, curses.KEY_DOWN):
                 index += 1 if key == curses.KEY_DOWN else -1
             elif key in (curses.KEY_PPAGE, curses.KEY_NPAGE):
@@ -1718,7 +1758,7 @@ class Viewer:
             height, width = self.screen.getmaxyx()
             draw()
             self.refresh()
-            key = self.screen.getch()
+            key = self.getch()
             pick = False
             if key == curses.KEY_UP:
                 choice = max(0, choice - 1)
@@ -1783,7 +1823,7 @@ class Viewer:
             self.put(height - 1, 0, ' ' * (width - 1), 'label')
             self.put_keys(height - 1, [('Enter', 'Sort'), ('Esc', 'Cancel')])
             self.refresh()
-            key = self.screen.getch()
+            key = self.getch()
             if key == curses.KEY_UP:
                 choice = max(0, choice - 1)
             elif key == curses.KEY_DOWN:
@@ -1882,10 +1922,13 @@ class Viewer:
         """A finished click or a wheel turn as a MouseEvent, else None. A click is a press and a release on the same
         cell, acted on at the release. A press dragged to another cell selects text instead, highlighted as it goes
         and copied at the release, and never clicks anything."""
-        try:
-            _, x, y, _, state = curses.getmouse()
-        except curses.error:
-            return None
+        if self.sgr_event:
+            (x, y, state), self.sgr_event = self.sgr_event, None
+        else:
+            try:
+                _, x, y, _, state = curses.getmouse()
+            except curses.error:
+                return None
         if state & curses.BUTTON4_PRESSED:
             return MouseEvent('wheel', x, y, -1)
         if state & getattr(curses, 'BUTTON5_PRESSED', 0):  # missing from older ncurses builds
@@ -2127,7 +2170,7 @@ class Viewer:
             if self.mode:
                 self.show_cursor(1)
                 self.screen.move(self.screen.getmaxyx()[0] - 1, min(self.cursor_x, self.width - 2))
-            key = self.screen.getch()
+            key = self.getch()
             if key != -1:
                 self.notice = ''
             if key == -1:  # the refresh delay passed
@@ -2474,7 +2517,7 @@ def main(argv):
             curses.wrapper(lambda screen: Viewer(screen, store, settings, LiveSampler(store) if live else None,
                                                  use_color, unicode, args.filter, not args.no_mouse).run())
         finally:
-            sys.stdout.write('\033[?1002l')  # drag reports off, should the terminal keep them past ncurses' reset
+            sys.stdout.write('\033[?1002l\033[?1006l')  # drag and SGR reports off, should ncurses' reset miss them
             sys.stdout.flush()
     else:
         parser.error('expected SOURCE, at TIME [SOURCE], export [SOURCE], sql QUERY [SOURCE], or collect')
