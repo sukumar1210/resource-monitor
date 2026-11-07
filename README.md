@@ -84,7 +84,7 @@ is printed as it runs (`==> ...`).
 | --- | --- |
 | Left / Right, Shift+Left / Right | move the marker a column / a screen width |
 | `^` `$` | oldest sample / newest (live) |
-| `g` | go to a time: `12/10/2026 14:30 IST`, `2 Feb 2025 UTC`, `Oct 12 2026 2:30 pm`, `14:30` (dates are day first) |
+| `g` | go to a time: `12/10/2026 14:30 IST`, `2 Feb 2025 UTC`, `Oct 12 2026 2:30 pm`, `14:30` (dates are day first); Esc or a click cancels |
 | `[` `]` | coarser / finer columns |
 | `s` | statistic |
 | Tab | graph memory, CPU, load or swap |
@@ -94,13 +94,18 @@ is printed as it runs (`==> ...`).
 | F5 `t` | tree or list view |
 | F6 `<` `>`, `M` `P` `N`, `I` | sort column, sort by MEM% / CPU% / PID, reverse |
 | F2 | setup: time zone, statistic, granularity, graph, refresh delay, view, and the recording |
-| F1 `h` `?`, F10 `q` | help, quit |
+| F1 `h` `?`, F10 `q`, Ctrl+C | help, quit |
 
-The mouse works as in htop, acting when the button is released: click a row, a fold marker, a column title (again to
-reverse), a graph tab, a point on the graph, or a function-bar item; the wheel scrolls the table, or moves through
-time over the graph. To select and copy text while the mouse is on, hold **Shift** as you drag (Option in iTerm2; Fn,
-or View › Allow Mouse Reporting off, in macOS Terminal), as with htop. Turn the mouse off in F2 Setup (saved), or for
-one run with `-M`.
+The mouse acts when the button is released: click a row, a fold marker, a column title (again to reverse), a graph
+tab, a point on the graph, or a function-bar item; the wheel scrolls the table, or moves through time over the graph.
+
+**Copying text.** A terminal hands every click and drag to a program that uses the mouse, so it can't select text
+itself. hmon does the selecting instead: hold the button and drag, and what you drag over is highlighted and copied
+when you let go. It reaches the clipboard through the terminal (OSC 52), which iTerm2 (Settings › General › Selection ›
+Applications in terminal may access clipboard), kitty, WezTerm, Alacritty, Windows Terminal and tmux (`set -g
+set-clipboard on`) accept, and macOS Terminal doesn't. Where that doesn't work, use the terminal's own selection: turn
+the mouse off in F2 Setup (saved) or for one run with `-M`, or hold **Shift** as you drag (Option in iTerm2; Fn in
+macOS Terminal).
 
 **Setup (F2).** Enter or a click opens a setting's dropdown, where typing filters the list (`kolk` finds
 `Asia/Kolkata` among the system's time zones, each shown with its UTC offset); Left/Right steps through the choices.

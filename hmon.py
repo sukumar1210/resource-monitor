@@ -5,6 +5,7 @@ Run `hmon --help` for options; inside the viewer, F1 shows the keys and F2 the s
 """
 import argparse
 import atexit
+import base64
 import calendar
 import contextlib
 import csv
@@ -687,6 +688,7 @@ def app_of(proc, by_pid):
 
 Node = namedtuple('Node', 'kind key label pid mem cpu count children')
 TableRow = namedtuple('TableRow', 'key kind pid label mem cpu count containers tree has_children is_open group app')
+MouseEvent = namedtuple('MouseEvent', 'kind x y step')  # kind: click or wheel; step: -1 up, 1 down
 
 
 def sort_value(sort_key):
@@ -1013,6 +1015,7 @@ class Viewer:
         self.screen, self.store, self.sampler = screen, store, sampler
         self.mouse, self.mouse_on = mouse, settings.get('mouse', 'on') == 'on'  # -M turns it off for this run only
         self.regions, self.row_top, self.tree_x = [], 0, 0  # clickable areas of the last frame
+        self.shown, self.pressed_at, self.dragged_to = {}, None, None
         self.glyphs = GLYPHS if unicode else ASCII_GLYPHS
         self.styles = self.make_styles(use_color and curses.has_colors())
         self.columns, self.graph_values = {}, {}  # caches, by column start and the settings that shape them
@@ -1061,11 +1064,15 @@ class Viewer:
                 'mouse': 'on' if self.mouse_on else 'off'}
 
     def apply_mouse(self):
-        """Mouse on: clicks go to hmon, and holding Shift (Option in iTerm2) lets the terminal select text instead.
-        Mouse off: dragging selects text."""
+        """Mouse on: clicks go to hmon and a drag selects text through hmon; holding Shift (Option in iTerm2) lets the
+        terminal select instead. Mouse off: the terminal selects text as usual."""
+        on = self.mouse and self.mouse_on
         try:
-            curses.mousemask(curses.ALL_MOUSE_EVENTS if self.mouse and self.mouse_on else 0)
+            curses.mousemask(curses.ALL_MOUSE_EVENTS | curses.REPORT_MOUSE_POSITION if on else 0)
             curses.mouseinterval(0)  # report presses at once instead of waiting to tell clicks from double-clicks
+            self.screen.refresh()  # ncurses' own mouse switch goes out first, or it would undo the next line
+            sys.stdout.write('\033[?1002h' if on else '\033[?1002l')  # report drags too, so hmon can select text
+            sys.stdout.flush()
         except curses.error:
             pass
 
@@ -1087,10 +1094,22 @@ class Viewer:
     def align(self, t):
         return (t + self.shift) // self.zoom * self.zoom - self.shift
 
+    def erase(self):
+        self.screen.erase()
+        self.shown = {}  # what's on screen by (row, column), so a mouse drag can copy it
+
+    def refresh(self):
+        if self.dragged_to:  # a redraw mid-drag keeps the selection showing
+            self.paint(self.selection(self.pressed_at, self.dragged_to), curses.A_REVERSE)
+        self.screen.refresh()
+
     def put(self, y, x, text, style='normal'):
         height, width = self.screen.getmaxyx()
         if 0 <= y < height and 0 <= x < width - 1 and text:
-            self.screen.addstr(y, x, text[:width - 1 - x], self.styles[style])
+            text = text[:width - 1 - x]
+            self.screen.addstr(y, x, text, self.styles[style])
+            for i, char in enumerate(text):
+                self.shown[(y, x + i)] = char, style
 
     def put_segments(self, y, x, segments):
         for text, style in segments:
@@ -1156,7 +1175,7 @@ class Viewer:
         else:
             self.rows = list_rows(column.procs, app_labels, self.sort_key, self.descending, self.filter)
 
-        self.screen.erase()
+        self.erase()
         self.regions = []  # (y0, y1, x0, x1, action(x, y)) for mouse clicks, rebuilt with every frame
         container_count = sum(1 for n in nodes for c in n.children if c.kind == 'container')
         self.draw_meters(width, column.host, len(column.procs), len(nodes), container_count)
@@ -1165,7 +1184,7 @@ class Viewer:
         self.table_top = 8 + graph_h
         self.draw_table(self.table_top, height - self.table_top - 1, width, column.host)
         self.draw_function_bar(height - 1, width)
-        self.screen.refresh()
+        self.refresh()
 
     def draw_meters(self, width, host, process_count, app_count, container_count):
         half = width // 2
@@ -1339,25 +1358,41 @@ class Viewer:
             pass
 
     def ask(self, y, question):
-        """A line of typed input on row `y`."""
-        width = self.screen.getmaxyx()[1]
-        self.put(y, 0, question.ljust(width - 1), 'label')
+        """A line of typed input on row `y`: Enter accepts; Esc or a click cancels (None); Backspace and Ctrl+U
+        edit. Ctrl+C quits hmon, as everywhere else."""
+        text = ''
         self.blocking(True)
-        curses.echo()
         self.show_cursor(1)
         try:
-            return self.screen.getstr(y, len(question), 40).decode(errors='replace').strip()
+            while True:
+                width = self.screen.getmaxyx()[1]
+                self.put(y, 0, (question + text).ljust(width - 1), 'label')
+                self.screen.move(y, min(len(question) + len(text), width - 2))
+                self.refresh()
+                key = self.screen.getch()
+                if key in (10, 13, curses.KEY_ENTER):
+                    return text.strip()
+                if key == 27:
+                    return None
+                if key == curses.KEY_MOUSE:
+                    event = self.mouse_event()
+                    if event and event.kind == 'click':
+                        return None
+                elif key in (curses.KEY_BACKSPACE, 127, 8):
+                    text = text[:-1]
+                elif key == 21:  # Ctrl+U
+                    text = ''
+                elif 32 <= key < 127:
+                    text += chr(key)
         finally:
-            curses.noecho()
             self.show_cursor(0)
             self.blocking(False)
-            self.screen.clear()  # repaint everything next time, so nothing echoed while typing lingers
 
     def show_help(self):
         """htop's help screen: title, what the meters show, then the keys in two columns."""
         g = self.glyphs
         self.blocking(True)
-        self.screen.erase()
+        self.erase()
         self.put(0, 1, f'hmon {VERSION} - htop for the past: what every app, container and process used, over time',
                  'value')
         self.put(1, 1, 'Meters and the table show the chosen statistic over the column under the marker; the newest '
@@ -1385,7 +1420,7 @@ class Viewer:
                 self.put(6 + i, x + 11, text, 'normal')
         height = self.screen.getmaxyx()[0]
         self.put(height - 1, 1, 'Press any key or click to return.', 'normal')
-        self.screen.refresh()
+        self.refresh()
         while self.screen.getch() == curses.KEY_MOUSE and not self.mouse_event():
             pass  # the release of the click that opened help, or a press: wait for a whole click or a key
         self.blocking(False)
@@ -1402,8 +1437,8 @@ class Viewer:
     def mouse_text(self, value):
         if not self.mouse:
             return f'{value}   (off for this run: -M)'
-        return f'{value}   ' + ('hold Shift (Option in iTerm2) to select text' if value == 'on'
-                                else 'dragging selects text; keys still work')
+        return f'{value}   ' + ('clicks act; a drag highlights text and copies it' if value == 'on'
+                                else 'the terminal selects text as usual; keys still work')
 
     def setting_options(self, name):
         """(options, current, name of an option, how its row in the dropdown reads) for one setting."""
@@ -1490,7 +1525,7 @@ class Viewer:
             self.put(height - 1, 0, ' ' * (width - 1), 'label')
             self.put_segments(height - 1, 0, [('Enter', 'key'), ('Pick  ', 'label'), ('Esc', 'key'), ('Cancel ', 'label'),
                                               ('  ', 'key'), ('type to filter', 'label')])
-            self.screen.refresh()
+            self.refresh()
             key = self.screen.getch()
             if key in (curses.KEY_UP, curses.KEY_DOWN):
                 index += 1 if key == curses.KEY_DOWN else -1
@@ -1510,11 +1545,10 @@ class Viewer:
                 event = self.mouse_event()
                 if not event:
                     continue
-                click_x, click_y, state = event
-                if self.wheel_step(state):
-                    index += 3 * self.wheel_step(state)
-                elif y < click_y <= y + rows and x <= click_x < x + box:
-                    return shown[top + click_y - y - 1] if top + click_y - y - 1 < len(shown) else None
+                if event.kind == 'wheel':
+                    index += 3 * event.step
+                elif y < event.y <= y + rows and x <= event.x < x + box:
+                    return shown[top + event.y - y - 1] if top + event.y - y - 1 < len(shown) else None
                 else:
                     return None
 
@@ -1530,7 +1564,7 @@ class Viewer:
 
         def draw():
             height, width = self.screen.getmaxyx()
-            self.screen.erase()
+            self.erase()
             self.put(0, 0, ' Setup'.ljust(width - 1), 'header')
             self.put(2, 2, 'Up/Down choose a setting. Enter or a click opens its list (type to filter); Left/Right '
                            'steps through it.', 'shadow')
@@ -1547,7 +1581,7 @@ class Viewer:
         while True:
             height, width = self.screen.getmaxyx()
             draw()
-            self.screen.refresh()
+            self.refresh()
             key = self.screen.getch()
             pick = False
             if key == curses.KEY_UP:
@@ -1562,8 +1596,8 @@ class Viewer:
                 pick = True
             elif key == curses.KEY_MOUSE:
                 event = self.mouse_event()
-                if event:
-                    click_x, click_y = event[0], event[1]
+                if event and event.kind == 'click':
+                    click_x, click_y = event.x, event.y
                     row = next((i for i in range(len(names)) if self.setting_row(i) == click_y), None)
                     if row is not None:  # a setting: select it, then open its list
                         pick, choice = row == choice, row
@@ -1612,7 +1646,7 @@ class Viewer:
                 self.put(self.table_top + 1 + i, 0, f' {option}'.ljust(14), 'selected' if i == choice else 'normal')
             self.put(height - 1, 0, ' ' * (width - 1), 'label')
             self.put_segments(height - 1, 0, [('Enter', 'key'), ('Sort  ', 'label'), ('Esc', 'key'), ('Cancel', 'label')])
-            self.screen.refresh()
+            self.refresh()
             key = self.screen.getch()
             if key == curses.KEY_UP:
                 choice = max(0, choice - 1)
@@ -1620,9 +1654,9 @@ class Viewer:
                 choice = min(len(options) - 1, choice + 1)
             elif key == curses.KEY_MOUSE:
                 event = self.mouse_event()
-                if not event:
-                    continue  # a press, or the release of the click that opened this panel
-                row = event[1] - self.table_top - 1
+                if not event or event.kind != 'click':
+                    continue  # a press, a drag, or the wheel
+                row = event.y - self.table_top - 1
                 if 0 <= row < len(options):
                     self.set_sort(options[row])
                 break
@@ -1706,24 +1740,72 @@ class Viewer:
                 return
         self.search_failed = bool(self.search)
 
-    # ---- mouse, as in htop
+    # ---- mouse: clicks act on release, drags select text
 
     def mouse_event(self):
-        """(x, y, button state) of a finished click or a wheel turn, else None. Like htop, a click counts when the
-        button is released, so a dialog opened by a click isn't closed again by that click's release."""
+        """A finished click or a wheel turn as a MouseEvent, else None. A click is a press and a release on the same
+        cell, acted on at the release. A press dragged to another cell selects text instead, highlighted as it goes
+        and copied at the release, and never clicks anything."""
         try:
             _, x, y, _, state = curses.getmouse()
         except curses.error:
             return None
-        wheel = curses.BUTTON4_PRESSED | getattr(curses, 'BUTTON5_PRESSED', 0)  # missing from older ncurses
-        return (x, y, state) if state & (curses.BUTTON1_RELEASED | curses.BUTTON1_CLICKED | wheel) else None
-
-    @staticmethod
-    def wheel_step(state):
-        """-1 for the wheel turned up, 1 for down, 0 for a click."""
         if state & curses.BUTTON4_PRESSED:
-            return -1
-        return 1 if state & getattr(curses, 'BUTTON5_PRESSED', 0) else 0
+            return MouseEvent('wheel', x, y, -1)
+        if state & getattr(curses, 'BUTTON5_PRESSED', 0):  # missing from older ncurses builds
+            return MouseEvent('wheel', x, y, 1)
+        if state & curses.REPORT_MOUSE_POSITION:
+            if self.pressed_at:
+                if self.dragged_to:
+                    self.paint(self.selection(self.pressed_at, self.dragged_to), 0)
+                self.dragged_to = (x, y)
+                self.refresh()
+            return None
+        if state & curses.BUTTON1_PRESSED:
+            self.pressed_at, self.dragged_to = (x, y), None
+            return None
+        if state & curses.BUTTON1_RELEASED:
+            start, dragged = self.pressed_at, self.dragged_to
+            self.pressed_at = self.dragged_to = None
+            if dragged:
+                self.paint(self.selection(start, dragged), 0)
+            if start and start != (x, y):
+                self.copy_text(self.selection(start, (x, y)))
+                return None
+            return MouseEvent('click', x, y, 0)
+        if state & curses.BUTTON1_CLICKED:
+            return MouseEvent('click', x, y, 0)
+        return None
+
+    def selection(self, start, end):
+        """The cells from one (x, y) to another in reading order, line by line as a terminal selects text."""
+        (x0, y0), (x1, y1) = sorted([start, end], key=lambda cell: (cell[1], cell[0]))
+        last = self.screen.getmaxyx()[1] - 2  # put() never writes the last column
+        return [(y, x) for y in range(y0, y1 + 1)
+                for x in range(x0 if y == y0 else 0, min(x1 if y == y1 else last, last) + 1)]
+
+    def paint(self, cells, attr):
+        """Redraws `cells` as they were put, with `attr` added: A_REVERSE shows a selection, 0 takes it down."""
+        for y, x in cells:
+            char, style = self.shown.get((y, x), (' ', 'normal'))
+            try:
+                self.screen.addstr(y, x, char, self.styles[style] | attr)
+            except curses.error:
+                pass  # off a screen made smaller mid-drag
+
+    def copy_text(self, cells):
+        """Puts the text in `cells` on the clipboard through the terminal's OSC 52 escape, which iTerm2 (with
+        "Applications in terminal may access clipboard"), kitty, WezTerm, Alacritty, Windows Terminal and tmux (with
+        set-clipboard on) honour. Others ignore it, so the notice names the ways that always work."""
+        text = '\n'.join(''.join(self.shown.get(cell, ' ')[0] for cell in row).rstrip()
+                         for _, row in groupby(cells, key=lambda cell: cell[0])).strip('\n')
+        if not text.strip():
+            return
+        sys.stdout.write(f'\033]52;c;{base64.b64encode(text.encode()).decode()}\a')
+        sys.stdout.flush()
+        preview = ' '.join(text.split())
+        preview = preview if len(preview) <= 30 else preview[:29] + '…'
+        self.notice = f'Copied "{preview}". Not pasting? Turn Mouse off in F2, or hold Shift (Option in iTerm2) to drag.'
 
     def click(self):
         """A click runs whatever was drawn under it; the wheel scrolls the table, or moves in time over the graph.
@@ -1731,17 +1813,15 @@ class Viewer:
         event = self.mouse_event()
         if not event:
             return True
-        x, y, state = event
-        step = self.wheel_step(state)
-        if step:
-            if y >= self.row_top:
-                self.move_selection(3 * step)
+        if event.kind == 'wheel':
+            if event.y >= self.row_top:
+                self.move_selection(3 * event.step)
             else:
-                self.cursor += step * self.zoom
+                self.cursor += event.step * self.zoom
             return True
         for y0, y1, x0, x1, action in self.regions:
-            if y0 <= y <= y1 and x0 <= x < x1:
-                return action(x, y) is not False
+            if y0 <= event.y <= y1 and x0 <= event.x < x1:
+                return action(event.x, event.y) is not False
         return True
 
     def press(self, key):
@@ -2114,11 +2194,18 @@ def main(argv):
         os.environ.setdefault('ESCDELAY', '25')
         use_color = not (args.no_color or os.environ.get('NO_COLOR'))
         unicode = not args.no_unicode and locale.getpreferredencoding(False).lower().replace('-', '') == 'utf8'
-        curses.wrapper(lambda screen: Viewer(screen, store, settings, LiveSampler(store) if live else None,
-                                             use_color, unicode, args.filter, not args.no_mouse).run())
+        try:
+            curses.wrapper(lambda screen: Viewer(screen, store, settings, LiveSampler(store) if live else None,
+                                                 use_color, unicode, args.filter, not args.no_mouse).run())
+        finally:
+            sys.stdout.write('\033[?1002l')  # drag reports off, should the terminal keep them past ncurses' reset
+            sys.stdout.flush()
     else:
         parser.error('expected SOURCE, at TIME [SOURCE], export [SOURCE], sql QUERY [SOURCE], or collect')
 
 
 if __name__ == '__main__':
-    main(sys.argv[1:])
+    try:
+        main(sys.argv[1:])
+    except KeyboardInterrupt:
+        sys.exit(130)  # Ctrl+C: quit quietly, with the shell's usual status for SIGINT

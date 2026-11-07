@@ -1,8 +1,12 @@
 """End-to-end checks: collect from a fake host, browse with the real viewer, export and query. `python3 -m unittest`"""
+import base64
 import contextlib
 import io
 import itertools
 import os
+import pty
+import select
+import sys
 import tempfile
 import time
 import unittest
@@ -19,10 +23,10 @@ class Stop(Exception):
 
 
 class FakeScreen:
-    """Stands in for the curses window: keys and typed lines in, one text frame out per key read."""
+    """Stands in for the curses window: keys in, one text frame out per key read."""
 
-    def __init__(self, keys, typed=(), rows=46, cols=150):
-        self.keys, self.typed, self.rows, self.cols = list(keys), list(typed), rows, cols
+    def __init__(self, keys, rows=46, cols=150):
+        self.keys, self.rows, self.cols = list(keys), rows, cols
         self.cells, self.frames = {}, []
 
     def getmaxyx(self):
@@ -51,18 +55,29 @@ class FakeScreen:
                                      for y in range(self.rows)))
         return self.keys.pop(0) if self.keys else ord('q')
 
-    def getstr(self, y, x, n):
-        return self.typed.pop(0).encode()
 
-
-def browse(data_dir, keys, typed=(), sampler=None, clicks=()):
+def browse(data_dir, keys, sampler=None, clicks=()):
     """Runs the viewer on `data_dir` with the given keys; returns the frames it drew."""
-    screen = FakeScreen(keys, typed)
+    screen = FakeScreen(keys)
     settings = dict(hmon.DEFAULTS, tz='UTC')
-    with mock.patch.object(hmon.curses, 'echo'), mock.patch.object(hmon.curses, 'noecho'), \
-            mock.patch.object(hmon.curses, 'getmouse', side_effect=list(clicks)):
+    with mock.patch.object(hmon.curses, 'getmouse', side_effect=list(clicks)):
         hmon.Viewer(screen, hmon.Store(data_dir), settings, sampler, use_color=False).run()
     return screen.frames
+
+
+def read_pty(fd, until=None):
+    """What a program in a pseudo-terminal wrote, up to `until` or until it exits."""
+    output, deadline = b'', time.time() + 10
+    while (until is None or until not in output) and time.time() < deadline:
+        if select.select([fd], [], [], 0.1)[0]:
+            try:
+                chunk = os.read(fd, 65536)
+            except OSError:  # Linux, once the program has exited
+                break
+            if not chunk:  # macOS
+                break
+            output += chunk
+    return output
 
 
 def proc_files(pid, ppid, command, cgroup, rss, ticks, start='100'):
@@ -186,10 +201,12 @@ class EndToEnd(unittest.TestCase):
                     [ts, 900, '', 'probe', 50 * MiB, 2.0, 'probe --live', 1, '/system.slice/probe.service']]
 
         header_click = (0, 10, 19, 0, hmon.curses.BUTTON1_RELEASED)  # the RES title of the table header
-        keys = ([ord('g'), ord('['), ord('['), ord('s'), ord('\t'), ord('\t'), ord('\\')] + [ord(c) for c in 'leak']
-                + [10, ord('\\'), 27, hmon.curses.KEY_MOUSE, hmon.curses.KEY_F2, 10] + [ord(c) for c in 'kolk']
-                + [10, 27])
-        frames = browse(data_dir, keys, typed=['6/11/2026 08:44 IST'], sampler=Live(), clicks=[header_click])
+        go_to = [ord(c) for c in '6/11/2026 08:44 IST'] + [10]
+        keys = ([ord('g')] + go_to + [ord('['), ord('['), ord('s'), ord('\t'), ord('\t'), ord('\\')]
+                + [ord(c) for c in 'leak'] + [10, ord('\\'), 27, hmon.curses.KEY_MOUSE, hmon.curses.KEY_F2, 10]
+                + [ord(c) for c in 'kolk'] + [10, 27])
+        frames = browse(data_dir, keys, sampler=Live(), clicks=[header_click])
+        frames = frames[:1] + frames[1 + len(go_to):]  # leave out the frames drawn while typing the time
 
         self.assertIn('live', frames[0].split('\n')[2])  # the newest column is the live sample
         self.assertIn('+ probe', frames[0])
@@ -226,6 +243,44 @@ class EndToEnd(unittest.TestCase):
         self.assertIn('Press any key or click to return.', frames[3])  # and a stray press doesn't close it
         self.assertNotIn('Press any key or click to return.', frames[4])
 
+    def test_go_to_cancels_and_a_drag_copies_text(self):
+        data_dir = self.history()
+        mouse = hmon.curses
+        clicks = [(0, 30, 3, 0, mouse.BUTTON1_PRESSED), (0, 30, 3, 0, mouse.BUTTON1_RELEASED),
+                  (0, 0, 45, 0, mouse.BUTTON1_PRESSED), (0, 3, 45, 0, mouse.REPORT_MOUSE_POSITION),
+                  (0, 5, 45, 0, mouse.BUTTON1_RELEASED)]  # a click, then a drag over the start of the function bar
+        keys = [ord('g'), ord('1'), 27, ord('g')] + [mouse.KEY_MOUSE] * 5
+        terminal = io.StringIO()
+        with contextlib.redirect_stdout(terminal):
+            frames = browse(data_dir, keys, clicks=clicks)
+
+        self.assertTrue(frames[2].split('\n')[45].endswith('): 1'), frames[2])  # what's typed shows as it's typed
+        self.assertNotIn('Go to', frames[3])  # Esc cancels
+        self.assertNotIn('Could not read', frames[3])
+        self.assertIn('Go to', frames[5])
+        self.assertNotIn('Go to', frames[6])  # and so does a click
+        dragged = frames[8].split('\n')[45][:6]
+        self.assertIn('F1', dragged)
+        self.assertIn(f'\033]52;c;{base64.b64encode(dragged.encode()).decode()}\a', terminal.getvalue())
+        self.assertIn(f'Copied "{dragged}"', frames[9])
+        self.assertNotIn('Press any key or click to return.', frames[9])  # the drag ended on F1 without opening help
+
+    def test_ctrl_c_quits_quietly(self):
+        data_dir = self.history()
+        home = os.path.join(self.dir.name, 'home')
+        pid, fd = pty.fork()
+        if pid == 0:  # the viewer, in a terminal of its own
+            os.environ.update(TERM='xterm', HOME=home, XDG_CONFIG_HOME=home)
+            os.execv(sys.executable, [sys.executable, os.path.abspath(hmon.__file__), data_dir])
+        shown = read_pty(fd, until=b'Quit')
+        os.write(fd, b'\x03')
+        shown += read_pty(fd)
+        _, status = os.waitpid(pid, 0)
+        os.close(fd)
+        self.assertIn(b'Quit', shown)
+        self.assertNotIn(b'Traceback', shown)
+        self.assertEqual(os.WEXITSTATUS(status), 130)
+
     def test_setup_changes_what_the_installer_asked(self):
         data_dir = self.history()
         unit, rule = os.path.join(self.dir.name, 'hmon.service'), os.path.join(self.dir.name, 'hmon.conf')
@@ -247,8 +302,8 @@ class EndToEnd(unittest.TestCase):
         self.assertIn('what the installer asked', frames[1])
         self.assertRegex(frames[1], r'Sample every\s+60 s\s+about [\d,]+ MB a day')
         self.assertRegex(frames[1], r'Keep\s+14 days\s+about [\d,]+ MB in all')
-        self.assertRegex(frames[1], r'Mouse\s+on\s+hold Shift \(Option in iTerm2\) to select text')
-        self.assertRegex(frames[8], r'Mouse\s+off\s+dragging selects text')  # Right steps through the choices
+        self.assertRegex(frames[1], r'Mouse\s+on\s+clicks act; a drag highlights text and copies it')
+        self.assertRegex(frames[8], r'Mouse\s+off\s+the terminal selects text')  # Right steps through the choices
         self.assertRegex(frames[10], r'Sample every\s+30 s')
         self.assertRegex(frames[13], r'7 days\s+about [\d,]+ MB in all')  # the retention dropdown, filtered
         self.assertIn('Recording every 30 s, kept 7 days; the hmon service restarted.', frames[15])

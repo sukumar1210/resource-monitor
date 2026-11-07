@@ -1,3 +1,10 @@
+What's new in version 0.2.3
+
+* Dragging selects text: what you drag over is highlighted and copied to the clipboard when you let go (OSC 52), and
+  no longer clicks what's under the release
+* Go to: Esc or a click cancels; Backspace and Ctrl+U edit what's typed
+* Ctrl+C quits quietly, with status 130, instead of printing a traceback
+
 What's new in version 0.2.2
 
 * Installer: an update keeps the sampling interval and retention already set instead of asking again
