@@ -256,6 +256,8 @@ class EndToEnd(unittest.TestCase):
         self.assertRegex(next(line for line in ranged if '+ leak' in line), r'170M\s+-\s+\+ leak')  # not running live
         self.assertRegex(next(line for line in ranged if '+ probe' in line), r'-\s+50\.0M\s+\+ probe')  # live only
         self.assertIn('2 bars in the table, Esc for one', frames[6])
+        self.assertRegex(frames[6].split('\n')[16], '▲═|═▲')  # the range shows on the axis, from the marker
+        self.assertNotIn('═', frames[7].split('\n')[16])
         self.assertRegex(table(frames[7])[0], r'PID\s+RES\s+CPU%\s+MEM%')  # Esc: one bar again
         self.assertRegex(table(frames[10])[0], r'06 Nov 02:00\s+06 Nov 03:00\s+06 Nov 04:00▽')  # a drag on the graph
         self.assertEqual(terminal.getvalue(), '')  # picks bars, and copies no text

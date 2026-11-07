@@ -92,7 +92,7 @@ leaves `/usr/local/bin` off its PATH on some systems, such as Amazon Linux).
 | `[` `]` | coarser / finer columns |
 | `s` | statistic |
 | Tab, Shift+Tab | graph memory, CPU, load or swap (Shift+Tab goes back) |
-| Space, Esc | a range of bars from the marker, stretched with Left / Right: the table shows each bar as a column (RES, or CPU% on the CPU graph; `-` where a process wasn't running); Esc goes back to one bar |
+| Space, Esc | a range of bars from the marker, stretched with Left / Right and marked `═` on the x axis: the table shows each bar as a column (RES, or CPU% on the CPU graph; `-` where a process wasn't running); Esc goes back to one bar |
 | Up / Down, PgUp / PgDn, Home / End | select a row |
 | `+` / `-`, Enter, `*` | unfold / fold the selected app or container, toggle it, toggle everything |
 | F3 `/`, F4 `\` | search, filter (case-insensitive; `\|` separates terms) |

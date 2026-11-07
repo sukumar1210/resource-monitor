@@ -839,9 +839,9 @@ UNIT_PREFIXES = 'KMGTPEZYRQ'
 SORT_COLUMNS = {'PID': False, 'RES': True, 'CPU%': True, 'MEM%': True}  # column -> descending by default, as in htop
 BLOCKS = '▁▂▃▄▅▆▇█'
 GLYPHS = dict(bars=BLOCKS, vert='│', hline='─', corner='└', marker='▲', tee='├', bend='└', open='+', shut='─',
-              asc='△', desc='▽', left_right='← / →', up_down='↑ / ↓')
+              asc='△', desc='▽', left_right='← / →', up_down='↑ / ↓', range='═')
 ASCII_GLYPHS = dict(bars='.:-=+*#@', vert='|', hline='-', corner='+', marker='^', tee='`', bend='`', open='+',
-                    shut='-', asc='+', desc='-', left_right='Lt / Rt', up_down='Up / Dn')
+                    shut='-', asc='+', desc='-', left_right='Lt / Rt', up_down='Up / Dn', range='=')
 
 
 def kbytes_segments(kib):
@@ -1400,15 +1400,14 @@ class Viewer:
         for col, (start, value) in enumerate(zip(starts, values)):
             eighths = round(min(value, ceiling) / ceiling * graph_h * 8) if value is not None else 0
             is_marker = start == self.cursor
-            style = 'marker' if is_marker else 'selected' if low is not None and low <= start <= high else 'graph'
             for row in range(graph_h):
                 filled = eighths - (graph_h - 1 - row) * 8
                 char = g['bars'][7] if filled >= 8 else g['bars'][filled - 1] if filled > 0 else (g['vert'] if is_marker else ' ')
-                self.put(top + 1 + row, 6 + col, char, style)
+                self.put(top + 1 + row, 6 + col, char, 'marker' if is_marker else 'graph')
             if is_marker:
                 self.put(axis, 6 + col, g['marker'], 'marker')
-            elif style == 'selected':
-                self.put(axis, 6 + col, g['hline'], style)
+            elif low is not None and low <= start <= high:  # a range shows on the axis only, so its bars read as usual
+                self.put(axis, 6 + col, g['range'], 'marker')
             if (start + self.shift) % LABEL_EVERY[self.zoom] == 0:
                 self.put(axis + 1, 6 + col, label(start, time_format), 'shadow')
 
@@ -1965,10 +1964,10 @@ class Viewer:
 
     def selection(self, start, end):
         """The cells from one (x, y) to another in reading order, line by line as a terminal selects text."""
-        if self.on_graph(start):  # a drag that starts on the graph picks bars: whole columns of it, not text
-            top, axis, starts = self.graph_area
+        if self.on_graph(start):  # a drag that starts on the graph picks bars, shown on the axis under them
+            _, axis, starts = self.graph_area
             x0, x1 = sorted(min(max(x, 6), 5 + len(starts)) for x in (start[0], end[0]))
-            return [(y, x) for y in range(top, axis + 1) for x in range(x0, x1 + 1)]
+            return [(axis, x) for x in range(x0, x1 + 1)]
         (x0, y0), (x1, y1) = sorted([start, end], key=lambda cell: (cell[1], cell[0]))
         last = self.screen.getmaxyx()[1] - 2  # put() never writes the last column
         return [(y, x) for y in range(y0, y1 + 1)

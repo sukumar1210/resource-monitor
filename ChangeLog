@@ -1,3 +1,8 @@
+What's new in version 0.2.11
+
+* A range of bars shows only on the graph's x axis, as a yellow ═ up to the marker's ▲; its bars look as they do
+  otherwise, instead of turning inside out
+
 What's new in version 0.2.10
 
 * The graph fills the screen again, and clicks and drags reach every column of it: where the terminfo only knows X10
