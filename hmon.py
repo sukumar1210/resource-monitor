@@ -1755,7 +1755,7 @@ class Viewer:
                     notices.append(f'Could not change the recording: {error}.')
             else:
                 notices.append(f'To record every {interval} s and keep {days} days, run: '
-                               f'sudo hmon configure --interval {interval} --retention {days}')
+                               f'hmon configure --interval {interval} --retention {days}')
         try:
             save_settings(self.settings())
             notices.append(f'Settings saved to {CONFIG_PATH}.')
@@ -2274,12 +2274,13 @@ INSTALLED_FILES = ['/etc/systemd/system/hmon.service', '/etc/systemd/system/hmon
                    '/etc/tmpfiles.d/hmon.conf', '/etc/systemd/journald.conf.d/hmon.conf']  # what install.sh puts in place
 
 
-def as_root(command):
-    """Runs `hmon COMMAND` again under sudo; it doesn't return."""
+def as_root(args):
+    """Runs `hmon ARGS` again under sudo, by this file's full path, since sudo's PATH may leave out /usr/local/bin (as
+    on Amazon Linux); it doesn't return."""
     try:
-        os.execvp('sudo', ['sudo', sys.executable, os.path.abspath(sys.argv[0]), command])
+        os.execvp('sudo', ['sudo', sys.executable, os.path.abspath(sys.argv[0])] + list(args))
     except OSError:
-        sys.exit(f'sudo is missing here; run `hmon {command}` as root.')
+        sys.exit(f'sudo is missing here; run `hmon {" ".join(args)}` as root.')
 
 
 def confirm(question):
@@ -2294,7 +2295,7 @@ def uninstall():
     """Stops and removes the hmon services, the command and the installer's system files; asks separately whether
     the recorded samples and the settings go too, each kept unless the answer is yes."""
     if os.geteuid() != 0:
-        as_root('uninstall')
+        as_root(['uninstall'])
     configs = {os.path.dirname(CONFIG_PATH)}
     if os.environ.get('SUDO_USER'):  # the settings of whoever ran `hmon uninstall`, not just root's
         configs.add(os.path.join(os.path.expanduser('~' + os.environ['SUDO_USER']), '.config', 'hmon'))
@@ -2331,7 +2332,7 @@ def update():
         return
     if os.geteuid() != 0:  # the installer replaces /usr/local/bin/hmon and restarts the service
         print(f'hmon {newest} is out (this is {VERSION}); updating needs sudo.', flush=True)
-        as_root('update')
+        as_root(['update'])
     url = f'https://github.com/{REPO}/releases/download/v{newest}/install.sh'
     print(f'Downloading the hmon {newest} installer...', flush=True)
     try:
@@ -2424,8 +2425,8 @@ def main(argv):
             return
         if any(value is not None and value < 1 for value in (args.interval, args.retention)):
             parser.error('--interval and --retention take a whole number above 0')
-        if os.geteuid() != 0:
-            sys.exit('Changing the recording rewrites the hmon service; run this with sudo.')
+        if os.geteuid() != 0:  # it rewrites the hmon service
+            as_root(argv)
         configure_recording(args.interval or interval, args.retention or days)
         print(f'Recording every {args.interval or interval} s, kept {args.retention or days} days; '
               'the hmon service restarted.')

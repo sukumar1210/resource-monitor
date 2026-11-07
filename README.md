@@ -61,7 +61,7 @@ is printed as it runs (`==> ...`).
 - No questions: `... | sudo INTERVAL=60 RETENTION_DAYS=14 bash`
 - A specific release: `.../releases/download/v0.2.2/install.sh` in place of `.../releases/latest/download/install.sh`.
 - Update: `hmon update` (it asks for sudo) runs the newest release's installer, which keeps your answers and the data
-  without asking; change the answers in F2 Setup or with `sudo hmon configure --interval SECONDS --retention DAYS`.
+  without asking; change the answers in F2 Setup or with `hmon configure --interval SECONDS --retention DAYS`.
   When a newer release is out, the viewer says so at the bottom right.
 - If journald keeps its log in memory (`Storage=volatile`, as with log2ram), the installer says so and moves on: the
   kernel's OOM reports then won't survive a reboot, though hmon's own samples do.
@@ -73,7 +73,8 @@ is printed as it runs (`==> ...`).
 ## Use
 
 `hmon` opens the viewer, like htop: no sudo needed. Hosts that hide other users' processes (`/proc` mounted with
-`hidepid`) keep the data root-only, as htop needs root there too: `sudo hmon`.
+`hidepid`) keep the data root-only, as htop needs root there too: `sudo /usr/local/bin/hmon` (by path, since sudo
+leaves `/usr/local/bin` off its PATH on some systems, such as Amazon Linux).
 
 - **Meters** (CPU, Mem, Swp, tasks, load, time) and the **table** show the column under the marker.
 - **The graph** plots memory, CPU, load or swap over time, one column per 10 s, 1 min, 5 min, 15 min, 30 min,
@@ -118,9 +119,9 @@ abbreviation. Left/Right steps through the choices.
 Settings are saved to `~/.config/hmon/hmonrc`; `--tz` or `TZ` override the time zone for one run.
 
 The **Recording** section holds what the installer asked: how often to sample and how many days to keep, with the
-disk each choice takes on this host. Changing them rewrites the hmon service and restarts it, so under `sudo hmon` it
-applies when you leave Setup; otherwise Setup shows the command, which also works on its own:
-`sudo hmon configure --interval 10 --retention 3` (`hmon configure` alone prints the current values).
+disk each choice takes on this host. Changing them rewrites the hmon service and restarts it, so as root it applies
+when you leave Setup; otherwise Setup shows the command, which also works on its own and asks for sudo:
+`hmon configure --interval 10 --retention 3` (`hmon configure` alone prints the current values).
 
 Options, as in htop: `-C` monochrome (also `NO_COLOR`), `-U` ASCII only, `-F FILTER`, `-s COLUMN`, `-d DELAY`
 (tenths of a second for the live refresh), `-M` no mouse, `-V` version.

@@ -30,7 +30,7 @@ if [ "${1:-}" = uninstall ]; then
 fi
 
 python3 -c 'import sys; sys.exit(sys.version_info < (3, 7))' 2>/dev/null || { echo "hmon needs Python 3.7+ as python3"; exit 1; }
-previous_version=$(hmon --version 2>/dev/null || true)
+previous_version=$(/usr/local/bin/hmon --version 2>/dev/null || true)  # by path: sudo may leave /usr/local/bin off PATH
 
 ask() {  # ask QUESTION DEFAULT: the answer typed at the terminal (even when this script comes through a pipe)
     local answer=''
@@ -71,7 +71,7 @@ for answer in "$INTERVAL" "$RETENTION_DAYS"; do
     esac
 done
 echo "Recording every ${INTERVAL} s and keeping ${RETENTION_DAYS} days: about $(( $(mb_per_day "$INTERVAL") * RETENTION_DAYS )) MB on disk."
-echo "Change it any time in hmon's F2 Setup, or with: sudo hmon configure --interval SECONDS --retention DAYS"
+echo "Change it any time in hmon's F2 Setup, or with: hmon configure --interval SECONDS --retention DAYS"
 
 # Persistent journal, so kernel OOM reports and container events survive a reboot. Where journald keeps its log in
 # memory on purpose (Storage=volatile, as log2ram setups do), it never confirms a flush, so don't wait for one.
@@ -156,7 +156,7 @@ timeout 90 systemctl restart "${units[@]}" || echo "    the restart is taking lo
 for unit in "${units[@]}"; do
     echo "$unit: $(systemctl is-active "$unit" || true)"
 done
-version=$(hmon --version)
+version=$(/usr/local/bin/hmon --version)
 if [ -n "$previous_version" ] && [ "$previous_version" != "$version" ]; then
     echo "Updated $previous_version -> $version"
 fi
@@ -164,5 +164,5 @@ echo "$version is recording to /var/lib/hmon, kept ${RETENTION_DAYS} days."
 if [ "$data_mode" = 0755 ]; then
     echo "Open the viewer with: hmon"
 else
-    echo "This host hides other users' processes (hidepid), so like htop, hmon needs root to show them: sudo hmon"
+    echo "This host hides other users' processes (hidepid), so like htop, hmon needs root to show them: sudo /usr/local/bin/hmon"
 fi

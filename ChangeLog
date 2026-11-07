@@ -1,3 +1,10 @@
+What's new in version 0.2.8
+
+* Installer: no "hmon: command not found" at the end of an update where sudo leaves /usr/local/bin off its PATH
+  (Amazon Linux); it now also reports "Updated old -> new" there
+* hmon configure asks for sudo itself, like hmon update and hmon uninstall, so no command needs "sudo hmon"
+* 0.2.7 was tagged but never published (a test failed on Python 3.7's curses); its changes, below, come with 0.2.8
+
 What's new in version 0.2.7
 
 * At 10 s and 1 min bars the live column shows what runs now, as htop does: a container stopped a moment ago is gone

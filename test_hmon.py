@@ -312,10 +312,11 @@ class EndToEnd(unittest.TestCase):
         data_dir = self.history()
         c = hmon.curses
         over_graph = (0, 40, 8, 0)
-        for wheel_down in (c.BUTTON5_PRESSED, c.REPORT_MOUSE_POSITION):  # the old ABI has no button 5
+        abis = [c.REPORT_MOUSE_POSITION] + ([c.BUTTON5_PRESSED] if hasattr(c, 'BUTTON5_PRESSED') else [])
+        for wheel_down in abis:  # the old ABI (Python 3.7's image has it) has no button 5, and the new one may be here
             with mock.patch.dict(vars(c)):
                 if wheel_down == c.REPORT_MOUSE_POSITION:
-                    del c.BUTTON5_PRESSED
+                    vars(c).pop('BUTTON5_PRESSED', None)
                 frames = browse(data_dir, [c.KEY_MOUSE] * 2,
                                 clicks=[over_graph + (c.BUTTON4_PRESSED,), over_graph + (wheel_down,)])
             times = [next(line for line in frame.split('\n') if 'Time:' in line) for frame in frames[:3]]
@@ -442,6 +443,15 @@ class EndToEnd(unittest.TestCase):
             self.assertEqual(f.read(), 'd /var/lib/hmon 0755 root root 7d\n')
         run.assert_any_call(['systemctl', 'restart', 'hmon'], check=True)
         self.assertIn('Recording every 30 s, kept 7 days.', out.getvalue())
+
+        with mock.patch.object(hmon, 'UNIT_PATH', unit), mock.patch.object(hmon, 'TMPFILES_PATH', rule), \
+                mock.patch.object(hmon.os, 'geteuid', return_value=1000), \
+                mock.patch.object(hmon.os, 'execvp', side_effect=SystemExit) as sudo, self.assertRaises(SystemExit):
+            hmon.main(['configure', '--interval', '10'])
+        command = sudo.call_args[0][1]  # not root: it runs itself again under sudo, by path, with its options
+        self.assertEqual(command[:2], ['sudo', sys.executable])
+        self.assertTrue(os.path.isabs(command[2]), command)
+        self.assertEqual(command[3:], ['configure', '--interval', '10'])
 
     def test_export_a_dump_and_query_it(self):
         data_dir = self.history()
