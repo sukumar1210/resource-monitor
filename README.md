@@ -92,6 +92,7 @@ leaves `/usr/local/bin` off its PATH on some systems, such as Amazon Linux).
 | `[` `]` | coarser / finer columns |
 | `s` | statistic |
 | Tab, Shift+Tab | graph memory, CPU, load or swap (Shift+Tab goes back) |
+| `i` | pin the marker's bar's tooltip: Up/Down walk its top apps in the table, Esc closes it |
 | Space, Esc | a range of bars from the marker, stretched with Left / Right and marked `═` on the x axis: the table shows each bar as a column (RES, or CPU% on the CPU graph; `-` where a process wasn't running); Esc goes back to one bar |
 | Up / Down, PgUp / PgDn, Home / End | select a row |
 | `+` / `-`, Enter, `*` | unfold / fold the selected app or container, toggle it, toggle everything |
@@ -103,7 +104,10 @@ leaves `/usr/local/bin` off its PATH on some systems, such as Amazon Linux).
 
 The mouse acts when the button is released: click a row, a fold marker, a column title (again to reverse), a graph
 tab, a point on the graph, or a function-bar item; the wheel scrolls the table, or moves through time over the graph.
-Drag across the graph to pick a range of bars for the table, as Space does. Where the terminfo only knows the old
+Hover over a bar for its tooltip: the tab's Average, Maximum and Minimum in that bar and, on Memory and CPU, the 3
+apps that used the most then. Click the bar (or press `i` for the marker's bar) to pin it: Up/Down then select its
+apps, and the table follows, unfolding and selecting each one; Esc closes it. Drag across the graph to pick a range
+of bars for the table, as Space does. Where the terminfo only knows the old
 X10 mouse reports, which can't say a column past 223, hmon asks the terminal for SGR reports and reads them
 itself, so clicks reach every column of a wide screen.
 

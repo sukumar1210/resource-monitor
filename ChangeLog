@@ -1,3 +1,11 @@
+What's new in version 0.2.13
+
+* Hover over a graph bar for its tooltip: the tab's Average, Maximum and Minimum in that bar and, on Memory and CPU,
+  the 3 apps that used the most then (listed once the pointer rests, so sweeping across bars stays quick)
+* Click a bar, or press i for the marker's bar, to pin its tooltip: Up/Down select its apps and the table follows,
+  unfolding and selecting each; Esc closes it and leaves the table there
+* A hover can never read as a turn of the wheel, even where ncurses has no button 5
+
 What's new in version 0.2.12
 
 * Opt-in metrics: temperature (every sensor), CPU power (RAPL) and battery draw, each turned on in F2 Setup's

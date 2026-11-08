@@ -484,6 +484,7 @@ LIVE_HOST_SECONDS = 900  # the viewer's own live host samples kept for the graph
 LIVE_PROCESS_SECONDS = 60  # and its live process samples, which are much bigger
 SAMPLE_LIMIT = 240  # samples a column reads for the table at most, evenly spread; the graph stays exact
 COLUMN_CACHE = 64  # columns kept computed
+WHEEL_DOWN = 1 << 40  # hmon's own button state for the wheel turned down, where ncurses has no button 5
 SGR_REPORT = re.compile(r'\[<(\d+);(\d+);(\d+)([Mm])')  # an SGR mouse report, after its ESC: button, column, row
 NOW_ZOOM = 60  # live bars this short show what runs now; longer ones keep their statistic, so a peak stays findable
 RELOAD_SECONDS = 30
@@ -799,9 +800,9 @@ MouseEvent = namedtuple('MouseEvent', 'kind x y step')  # kind: click or wheel; 
 
 def sgr_state(button, final):
     """The ncurses button state for an SGR mouse report: its button code, and M (press, drag, wheel) or m (release)."""
-    if button & 64:  # the wheel: 64 up, 65 down; where ncurses has no button 5 it reports down as a move
-        return curses.BUTTON4_PRESSED if button & 1 == 0 else getattr(curses, 'BUTTON5_PRESSED', curses.REPORT_MOUSE_POSITION)
-    if button & 32:  # moved with a button held
+    if button & 64:  # the wheel: 64 up, 65 down
+        return curses.BUTTON4_PRESSED if button & 1 == 0 else getattr(curses, 'BUTTON5_PRESSED', WHEEL_DOWN)
+    if button & 32:  # moved: with a button held, a drag; with none (35), a hover
         return curses.REPORT_MOUSE_POSITION
     if button & 3:  # the middle or right button
         return 0
@@ -939,9 +940,11 @@ UNIT_PREFIXES = 'KMGTPEZYRQ'
 SORT_COLUMNS = {'PID': False, 'RES': True, 'CPU%': True, 'MEM%': True}  # column -> descending by default, as in htop
 BLOCKS = '▁▂▃▄▅▆▇█'
 GLYPHS = dict(bars=BLOCKS, vert='│', hline='─', corner='└', marker='▲', tee='├', bend='└', open='+', shut='─',
-              asc='△', desc='▽', left_right='← / →', up_down='↑ / ↓', range='═')
+              asc='△', desc='▽', left_right='← / →', up_down='↑ / ↓', range='═', box='┌┐└┘─│├┤', folded='▸',
+              unfolded='▾')
 ASCII_GLYPHS = dict(bars='.:-=+*#@', vert='|', hline='-', corner='+', marker='^', tee='`', bend='`', open='+',
-                    shut='-', asc='+', desc='-', left_right='Lt / Rt', up_down='Up / Dn', range='=')
+                    shut='-', asc='+', desc='-', left_right='Lt / Rt', up_down='Up / Dn', range='=', box='++++-|++',
+                    folded='>', unfolded='v')
 
 
 def kbytes_segments(kib):
@@ -1050,6 +1053,14 @@ def bar_header_segments(widths, labels, marked, cell_w, descending, tree_mode, g
     if not tree_mode:
         segments.append((f'{"APP":<{app_w}}  ', 'header', None))
     return segments + [('App / Process' if tree_mode else 'Command', 'header', None)]
+
+
+def metric_text(metric, value):
+    """A graph tab's value as its tooltip shows it."""
+    if value is None:
+        return 'N/A'
+    return {'Load': f'{value:.2f}', 'Temp': f'{value:.1f}°', 'CPU W': f'{value:.1f}W',
+            'Batt W': f'{value:.1f}W'}.get(metric, f'{value:.1f}%')
 
 
 def bar_format(zoom):
@@ -1201,6 +1212,9 @@ class Viewer:
         self.shown, self.pressed_at, self.dragged_to, self.held = {}, None, None, False
         self.update_available = False
         self.own_sgr, self.sgr_event, self.blocked = False, None, False  # SGR mouse reports hmon reads itself
+        # the tooltip: the bar under the pointer, or a pinned one with a selection the table follows
+        self.hover, self.hover_bar, self.pin, self.pin_index = False, None, None, 0
+        self.tip_cells, self.tip_rows, self.tip_pending, self.tip_opened = [], {}, False, None
         self.anchor, self.bar_starts, self.graph_area = None, None, None  # a range of bars, from anchor to the marker
         self.glyphs = GLYPHS if unicode else ASCII_GLYPHS
         self.styles = self.make_styles(use_color and curses.has_colors())
@@ -1272,8 +1286,11 @@ class Viewer:
             sgr = ((curses.tigetstr('kmous') or b'').startswith(b'\033[<')
                    or b'1006' in (curses.tigetstr('XM') or b''))  # the terminfo says which reports ncurses reads
             self.own_sgr = bool(on and not sgr)  # X10 reports carry a column in one byte: none past 223
-            # report drags too, so hmon can select text; and where ncurses reads only X10, SGR reports for hmon to read
-            sys.stdout.write(('\033[?1002h' + ('\033[?1006h' if self.own_sgr else '')) if on else '\033[?1002l\033[?1006l')
+            # every move, for the graph's tooltip, unless the wheel turning down would look like one (an old ncurses)
+            self.hover = bool(on and (self.own_sgr or hasattr(curses, 'BUTTON5_PRESSED')))
+            # drags or every move; and where ncurses reads only X10, SGR reports for hmon to read
+            sys.stdout.write(('\033[?1003h' if self.hover else '\033[?1002h') + ('\033[?1006h' if self.own_sgr else '')
+                             if on else '\033[?1002l\033[?1003l\033[?1006l')
             sys.stdout.flush()
         except curses.error:
             pass
@@ -1334,6 +1351,11 @@ class Viewer:
         return spans
 
     # ---- data
+
+    def columns_read(self, start):
+        """Reads the column at `start` into the cache, so its tooltip can list its apps."""
+        if start is not None:
+            self.column_at(start)
 
     def column_at(self, start):
         """A bar's column for the meters and the table. On a short live bar that's the newest live sample alone, so
@@ -1413,6 +1435,7 @@ class Viewer:
         self.table_top = 8 + graph_h
         self.draw_table(self.table_top, height - self.table_top - 1, width, column.host)
         self.draw_function_bar(height - 1, width)
+        self.draw_tip()
         self.refresh()
 
     def bars(self):
@@ -1729,6 +1752,7 @@ class Viewer:
                 ('^ ^A', 'oldest sample'), ('$ ^E', 'newest sample (live)'), ('g', 'go to 12/10/2026 14:30 IST'),
                 ('[ ]', 'coarser / finer: 10 s .. 1 day'), ('s', 'statistic: avg max min p50/90/99'),
                 ('Tab S-Tab', 'graph: memory, CPU, load, swap, opt-ins'), ('Space', 'a range of bars, a table column each'),
+                ('i', 'pin the marker bar\'s tooltip (hover shows it)'),
                 ('Esc', 'back to one bar'), ('F2', 'setup: zone, defaults, recording')]
         right = [(g['up_down'], 'select a row'), ('PgUp PgDn', 'page through the rows'), ('Home End', 'first / last row'),
                  ('+ -', 'unfold / fold the selected app'), ('Enter', 'unfold or fold it'),
@@ -2093,10 +2117,11 @@ class Viewer:
 
     # ---- mouse: clicks act on release, drags select text
 
-    def mouse_event(self):
+    def mouse_event(self, hover=False):
         """A finished click or a wheel turn as a MouseEvent, else None. A click is a press and a release on the same
         cell, acted on at the release. A press dragged to another cell selects text instead, highlighted as it goes
-        and copied at the release, and never clicks anything."""
+        and copied at the release, and never clicks anything. With `hover`, a move with no button held is a 'hover'
+        event too (the main view's tooltip); elsewhere it's nothing."""
         if self.sgr_event:
             (x, y, state), self.sgr_event = self.sgr_event, None
         else:
@@ -2106,11 +2131,14 @@ class Viewer:
                 return None
         if state & curses.BUTTON4_PRESSED:
             return MouseEvent('wheel', x, y, -1)
-        if state & getattr(curses, 'BUTTON5_PRESSED', 0):  # missing from older ncurses builds
+        if state & (getattr(curses, 'BUTTON5_PRESSED', 0) | WHEEL_DOWN):  # button 5 is missing from older ncurses
             return MouseEvent('wheel', x, y, 1)
         if state & curses.REPORT_MOUSE_POSITION:
-            if not self.pressed_at and not hasattr(curses, 'BUTTON5_PRESSED'):
-                return MouseEvent('wheel', x, y, 1)  # how ncurses' old mouse ABI (no button 5) reports the wheel down
+            if not self.pressed_at:
+                if self.hover:  # the pointer moved with no button held
+                    return MouseEvent('hover', x, y, 0) if hover else None
+                if not hasattr(curses, 'BUTTON5_PRESSED'):
+                    return MouseEvent('wheel', x, y, 1)  # how ncurses' old mouse ABI (no button 5) reports the wheel down
             if self.pressed_at:
                 old = set(self.selection(self.pressed_at, self.dragged_to)) if self.dragged_to else set()
                 self.dragged_to = (x, y)
@@ -2186,10 +2214,20 @@ class Viewer:
     def click(self):
         """A click runs whatever was drawn under it; the wheel scrolls the table, or moves in time over the graph.
         Returns False to quit (a click on F10)."""
-        event = self.mouse_event()
+        event = self.mouse_event(hover=True)
         self.held = not event and self.pressed_at is not None  # a press or a drag in the main view
         if not event:
             return True
+        if event.kind == 'hover':
+            self.hover_over(event.x, event.y)
+            self.held = True  # only the tooltip changed, and hover_over has painted it
+            return True
+        if self.pin is not None:
+            if event.kind == 'click' and event.y in self.tip_rows and self.tip_box[1] <= event.x <= self.tip_box[3]:
+                self.pin_index = self.tip_rows[event.y]  # an app in the pinned tooltip: the table follows
+                self.follow(self.tip_apps(self.pin)[self.pin_index][0])
+                return True
+            self.pin = None  # anything else closes it, then does what it does
         if event.kind == 'wheel':
             if event.y >= self.row_top:
                 self.move_selection(3 * event.step)
@@ -2210,6 +2248,103 @@ class Viewer:
 
     def click_bar(self, start):
         self.cursor, self.anchor = start, None
+        self.pin_at(start)
+
+    # ---- the graph's tooltip: a bar's Average, Maximum and Minimum, and on Memory and CPU its top 3 apps
+
+    def hover_over(self, x, y):
+        bar = self.bar_at(x) if self.on_graph((x, y)) else None
+        if bar != self.hover_bar:
+            self.hover_bar = bar
+            if self.pin is None:
+                self.draw_tip()
+                self.screen.refresh()
+
+    def pin_at(self, start):
+        """Pins the tooltip of the bar at `start`: its first app is selected, and the table follows."""
+        self.pin, self.pin_index, self.hover_bar = start, 0, None
+        apps = self.tip_apps(start)
+        if apps:
+            self.follow(apps[0][0])
+
+    def tip_apps(self, start):
+        """The 3 apps that used the most of the tab's metric in the bar at `start`, as (name, value text); only Memory
+        and CPU have values per app."""
+        if self.metric not in ('Memory', 'CPU'):
+            return []
+        nodes, _ = build_tree(self.column_at(start), 'MEM%' if self.metric == 'Memory' else 'CPU%', True)
+        return [(node.label, ('N/A' if node.mem is None else human_unit(node.mem / 1024)) if self.metric == 'Memory'
+                 else ('N/A' if node.cpu is None else f'{node.cpu:.1f}%')) for node in nodes[:3]]
+
+    def follow(self, name):
+        """The table follows the pinned tooltip: app `name` unfolds and is selected there, and an app the tooltip
+        unfolded before folds back. In list view, the app's biggest process is selected."""
+        key = ('app', name)
+        if self.tip_opened not in (None, key):
+            self.toggled.discard(self.tip_opened)
+            self.tip_opened = None
+        if self.tree:
+            if key not in self.toggled:  # apps start folded; toggled holds what's flipped
+                self.toggled.add(key)
+                self.tip_opened = key
+            self.selected = key
+        else:
+            row = next((r for r in self.rows if r.app == name or r.app.startswith(name + '/')), None)
+            if row:
+                self.selected = row.key
+
+    def pinned_key(self, key):
+        """A key for the pinned tooltip: Up/Down move its selection, which the table follows; Esc closes it. Any other
+        key closes it and then does what it always does. Returns whether the tooltip took the key."""
+        apps = self.tip_apps(self.pin)
+        if key in (curses.KEY_UP, curses.KEY_DOWN) and apps:
+            self.pin_index = (self.pin_index + (1 if key == curses.KEY_DOWN else -1)) % len(apps)
+            self.follow(apps[self.pin_index][0])
+            return True
+        self.pin, self.tip_opened = None, None  # what the tooltip unfolded stays unfolded
+        return key == 27
+
+    def draw_tip(self):
+        """The tooltip of the pinned bar, or of the bar under the pointer, over the screen; the cells the last one
+        covered are repainted first. The top 3 of a bar not yet read wait for the pointer to rest (tip_pending)."""
+        self.paint(self.tip_cells, 0)
+        self.tip_cells, self.tip_rows = [], {}
+        start = self.pin if self.pin is not None else self.hover_bar
+        if start is None or self.graph_area is None or start not in self.graph_area[2]:
+            return
+        ready = (self.pin is not None or (start, self.zoom, self.statistic) in self.columns
+                 or (self.live_t is not None and start <= self.live_t < start + self.zoom))
+        self.tip_pending = not ready and self.metric in ('Memory', 'CPU')
+        if self.tip_pending:
+            self.screen.timeout(150)  # once the pointer rests that long, read the bar's apps
+        values = [metric_value(sample, self.metric) for sample in self.store.host_samples(start, start + self.zoom)]
+        rows = [(f' {statistic:<8} {metric_text(self.metric, aggregate(values, statistic))}', 'normal')
+                for statistic in ('Average', 'Maximum', 'Minimum')]
+        apps = self.tip_apps(start) if ready else []
+        g, (left, right, low_left, low_right, line, side, tee_left, tee_right) = self.glyphs, self.glyphs['box']
+        name_w = max([0] + [len(name) for name, _ in apps])
+        entries = [(f' {g["unfolded" if ("app", name) in self.toggled else "folded"]} {name:<{name_w}}  {value:>6}',
+                    'selected' if self.pin == start and i == self.pin_index else 'normal')
+                   for i, (name, value) in enumerate(apps)]
+        title = f' {label(start, bar_format(self.zoom))} '
+        width = max([len(title) + 2] + [len(text) + 1 for text, _ in rows + entries])
+        lines = ([(left + title + line * (width - len(title)) + right, 'header')]
+                 + [(side + text.ljust(width) + side, style) for text, style in rows]
+                 + ([(tee_left + line * width + tee_right, 'normal')] if entries else [])
+                 + [(side + text.ljust(width) + side, style) for text, style in entries]
+                 + [(low_left + line * width + low_right, 'normal')])
+        top, _, starts = self.graph_area
+        column, screen_w = 6 + starts.index(start), self.screen.getmaxyx()[1]
+        x = column + 2 if column + 2 + width + 2 < screen_w - 1 else max(0, column - width - 3)
+        for i, (text, style) in enumerate(lines):
+            try:
+                self.screen.addstr(top + i, x, text, self.styles[style])
+            except curses.error:
+                pass  # past the bottom of a small screen
+            self.tip_cells += [(top + i, x + j) for j in range(len(text))]
+        first = top + len(lines) - 1 - len(entries)
+        self.tip_rows = {first + i: i for i in range(len(entries))}
+        self.tip_box = (top, x, top + len(lines) - 1, x + width + 1)
 
     def click_bar_title(self, start):
         self.cursor = start
@@ -2261,6 +2396,8 @@ class Viewer:
     def handle(self, key):
         """Returns False to quit. htop's keys for the table; keys htop leaves free move through time."""
         char = chr(key) if 0 <= key < 256 else ''
+        if self.pin is not None and key != curses.KEY_MOUSE and self.pinned_key(key):
+            return True
         if char in ('q', 'Q') or key == curses.KEY_F10:
             return False
         if key == curses.KEY_F1 or char in ('h', '?'):
@@ -2297,6 +2434,8 @@ class Viewer:
             self.cursor = self.store.times[0]
         elif char in ('$', '\x05'):
             self.cursor = self.store.times[-1]
+        elif char == 'i':  # the marker's bar's tooltip, pinned
+            self.pin_at(self.cursor)
         elif char == ' ':  # a range of bars from here, which the marker's moves stretch
             self.anchor = None if self.anchor is not None else self.cursor
         elif key == 27:
@@ -2348,7 +2487,13 @@ class Viewer:
             key = self.getch()
             if key != -1:
                 self.notice = ''
-            if key == -1:  # the refresh delay passed
+            if key == -1 and self.tip_pending:  # the pointer rested on a bar: its top apps now
+                self.columns_read(self.hover_bar)
+                self.blocking(self.blocked)
+                self.draw_tip()
+                self.screen.refresh()
+                self.held = True
+            elif key == -1:  # the refresh delay passed
                 self.tick()
             elif self.mode:
                 self.edit(key)
@@ -2703,7 +2848,7 @@ def main(argv):
             curses.wrapper(lambda screen: Viewer(screen, store, settings, LiveSampler(store) if live else None,
                                                  use_color, unicode, args.filter, not args.no_mouse).run())
         finally:
-            sys.stdout.write('\033[?1002l\033[?1006l')  # drag and SGR reports off, should ncurses' reset miss them
+            sys.stdout.write('\033[?1002l\033[?1003l\033[?1006l')  # move and SGR reports off, should ncurses' reset miss them
             sys.stdout.flush()
     else:
         parser.error('expected SOURCE, at TIME [SOURCE], export [SOURCE], sql QUERY [SOURCE], or collect')

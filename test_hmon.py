@@ -358,6 +358,54 @@ class EndToEnd(unittest.TestCase):
         self.assertGreater(len(clicked.split('\n')[16].rstrip()), 223)  # on a graph as wide as the screen
         self.assertIn('Command', screen.frames[-1])  # Esc, then t (list view): keys that aren't a report still work
 
+    def test_hovering_a_bar_shows_its_tooltip(self):
+        data_dir = self.history()
+        c = hmon.curses
+        screen = FakeScreen([c.KEY_MOUSE, -1])  # the pointer moves onto a bar, then rests there
+        terminal = io.StringIO()  # an X10 terminfo, so hmon reads the reports and hovers work on any ncurses
+        with mock.patch.object(c, 'mousemask'), mock.patch.object(c, 'mouseinterval'), \
+                mock.patch.object(c, 'tigetstr', return_value=b'\x1b[M'), \
+                mock.patch.object(c, 'getmouse', side_effect=[(0, 100, 8, 0, c.REPORT_MOUSE_POSITION)]), \
+                contextlib.redirect_stdout(terminal):
+            hmon.Viewer(screen, hmon.Store(data_dir), dict(hmon.DEFAULTS, tz='UTC'), None, use_color=False).run()
+        self.assertIn('\x1b[?1003h', terminal.getvalue())  # every move is reported, so hover can be seen
+        moved, rested = screen.frames[1], screen.frames[2]
+        for statistic in ('Average', 'Maximum', 'Minimum'):
+            self.assertRegex(moved, statistic + r'\s+[\d.]+%')  # the bar's memory, at once
+        self.assertNotIn('▸ docker', moved)
+        self.assertRegex(rested, r'▸ docker\s+320M')  # and once the pointer rests, its top 3 apps
+        self.assertRegex(rested, r'▸ ssh')
+
+    def test_a_pinned_tooltip_walks_the_table(self):
+        data_dir = self.history()
+        c = hmon.curses
+        click = [(0, 100, 8, 0, c.BUTTON1_PRESSED), (0, 100, 8, 0, c.BUTTON1_RELEASED)]
+        frames = browse(data_dir, [c.KEY_MOUSE, c.KEY_MOUSE, c.KEY_DOWN, 27], clicks=click)
+        pinned, down, closed = frames[2], frames[3], frames[4]
+        self.assertIn('▾ docker', pinned)  # the click pins the bar's tooltip, its first app selected...
+        self.assertRegex(pinned, r'[├└]\+ openalgo')  # ...and unfolded in the table
+        self.assertIn('▾ leak', down)  # Down: the next app; the table follows
+        self.assertIn('/opt/leak/bin/leak --serve', down)
+        self.assertNotIn('openalgo', down)  # docker, unfolded by the tooltip, folds back
+        self.assertNotIn('▾', closed)  # Esc closes the tooltip
+        self.assertIn('/opt/leak/bin/leak --serve', closed)  # and the table stays where it was walked to
+
+    def test_a_hover_never_turns_the_wheel_on_an_old_ncurses(self):
+        data_dir = self.history()
+        c = hmon.curses
+        reports = ['[<64;100;9M', '[<35;100;9M', '[<65;100;9M']  # wheel up, a hover, wheel down, as SGR reports
+        keys = [key for report in reports for key in [27] + [ord(ch) for ch in report]]
+        screen = FakeScreen(keys)
+        with mock.patch.dict(vars(c)), mock.patch.object(c, 'mousemask'), mock.patch.object(c, 'mouseinterval'), \
+                mock.patch.object(c, 'tigetstr', return_value=b'\x1b[M'), contextlib.redirect_stdout(io.StringIO()):
+            vars(c).pop('BUTTON5_PRESSED', None)  # the old mouse ABI, which hmon reads SGR reports for itself
+            hmon.Viewer(screen, hmon.Store(data_dir), dict(hmon.DEFAULTS, tz='UTC'), None, use_color=False).run()
+        before = [i for i, key in enumerate(keys) if key == 27] + [len(keys)]  # the frames between reports
+        times = [next(line for line in screen.frames[i].split('\n') if 'Time:' in line) for i in before]
+        self.assertNotEqual(times[1], times[0])  # up: a column back
+        self.assertEqual(times[2], times[1])  # the hover moved nothing
+        self.assertEqual(times[3], times[0])  # down: forward again
+
     def test_mouse_clicks_act_on_release(self):
         data_dir = self.history()
         f1 = (1, 45)  # F1 Help on the function bar
