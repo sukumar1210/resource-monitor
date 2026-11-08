@@ -91,9 +91,10 @@ def proc_files(pid, ppid, command, cgroup, rss, ticks, start='100'):
 
 
 def fake_sys(root, energy):
-    """A /sys with a hwmon sensor, a thermal zone, a CPU package's RAPL counter (and a core part inside it, not to be
-    counted again) and a discharging battery."""
-    files = {'class/hwmon/hwmon0/temp1_input': '45000', 'class/thermal/thermal_zone0/temp': '52000',
+    """A /sys with two hwmon temperature sensors (and a thermal zone, which hwmon covers), a CPU package's RAPL
+    counter (and a core part inside it, not to be counted again) and a discharging battery."""
+    files = {'class/hwmon/hwmon0/temp1_input': '45000', 'class/hwmon/hwmon1/temp1_input': '52000',
+             'class/thermal/thermal_zone0/temp': '60000',
              'class/powercap/intel-rapl:0/name': 'package-0', 'class/powercap/intel-rapl:0/energy_uj': str(energy),
              'class/powercap/intel-rapl:0/max_energy_range_uj': '262143328850',
              'class/powercap/intel-rapl:0:0/name': 'core', 'class/powercap/intel-rapl:0:0/energy_uj': '7',
@@ -468,15 +469,20 @@ class EndToEnd(unittest.TestCase):
             hmon.main(['collect'])
         with open(glob.glob(os.path.join(data_dir, 'host_*.csv'))[0]) as f:
             rows = list(csv.reader(f))
-        self.assertEqual(rows[0][-3:], ['temp_c', 'cpu_power_w', 'battery_power_w'])
-        self.assertEqual(rows[2][-3:], ['52.0', '1.0', '12.5'])  # the hottest sensor; 120 J in 120 s; 12.5 W out
+        self.assertEqual(rows[0][-3:], ['temps_c', 'cpu_power_w', 'battery_power_w'])
+        self.assertEqual(rows[2][-3:], ['45;52', '1.0', '12.5'])  # every sensor; 120 J in 120 s; 12.5 W out
 
         with mock.patch.object(hmon, 'UNIT_PATH', os.path.join(self.dir.name, 'none.service')):
-            frames = browse(data_dir, [ord('\t')] * 6)
+            frames = browse(data_dir, [ord('\t')] * 4 + [ord('s'), ord('s'), ord('\t'), ord('\t')])
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                hmon.main(['sql', 'SELECT temp_avg_c, temp_max_c, temp_min_c FROM host WHERE temp_max_c > 0', data_dir])
         self.assertIn(' Swap   Temp   CPU W   Batt W ', frames[0])  # tabs for the metrics with readings
         self.assertIn(' 100°', frames[4])
-        self.assertIn('   2W', frames[5])  # watts scale to the most in view
-        self.assertIn('  14W', frames[6])
+        top = [frame.split('\n')[10][147] for frame in frames[4:7]]  # the newest bar's highest row at 48.5, 52, 45°
+        self.assertEqual(top, ['▃', '▆', '│'])  # Average, Maximum, Minimum: across the sensors as well as time
+        self.assertIn('   2W', frames[7])  # watts scale to the most in view
+        self.assertIn('  14W', frames[8])
+        self.assertRegex(out.getvalue(), r'48\.5\s+52\s+45')  # and sql has each sample's average, hottest, coolest
 
     def test_an_empty_opt_in_graph_says_why(self):
         data_dir = self.history()  # recorded before any opt-in
@@ -497,6 +503,33 @@ class EndToEnd(unittest.TestCase):
         self.assertIn('No CPU power readings: this CPU or kernel has no RAPL energy counters', laptop[5])
         self.assertIn('No battery here', laptop[6])
         self.assertIn('No temperature readings: this is a virtual machine (amazon), which has no such sensors', ec2[4])
+
+    def test_setup_turns_a_metric_on_through_sudo(self):
+        data_dir = self.history()
+        unit, rule = os.path.join(self.dir.name, 'hmon.service'), os.path.join(self.dir.name, 'hmon.conf')
+        with open(unit, 'w') as f:
+            f.write('[Service]\nEnvironment=HMON_INTERVAL=60\nExecStart=/usr/local/bin/hmon collect\n')
+        with open(rule, 'w') as f:
+            f.write('d /var/lib/hmon 0755 root root 14d\n')
+
+        def run(command, **kwargs):  # sudo runs hmon configure as root; systemctl does nothing here
+            if command[0] == 'sudo':
+                with mock.patch.object(hmon.os, 'geteuid', return_value=0):
+                    hmon.main(command[3:])
+            return mock.Mock(returncode=0)
+
+        keys = [hmon.curses.KEY_F2] + [hmon.curses.KEY_DOWN] * 9 + [hmon.curses.KEY_RIGHT, 27]  # Temperature: on
+        with mock.patch.object(hmon, 'UNIT_PATH', unit), mock.patch.object(hmon, 'TMPFILES_PATH', rule), \
+                mock.patch.object(hmon.os, 'geteuid', return_value=1000), mock.patch.object(hmon.curses, 'endwin'), \
+                mock.patch.object(hmon.subprocess, 'run', side_effect=run) as ran, \
+                contextlib.redirect_stdout(io.StringIO()):
+            frames = browse(data_dir, keys)
+        self.assertRegex(frames[11], r'Temperature\s+on\s+records every sensor')
+        self.assertEqual(ran.call_args_list[0][0][0][:2], ['sudo', sys.executable])  # not root: sudo, off the screen
+        with open(unit) as f:
+            self.assertIn('Environment=HMON_METRICS=temperature\n', f.read())  # it stuck
+        self.assertIn('The recording changed', frames[12])
+        self.assertIn(' Swap   Temp ', frames[12])  # and its tab is there at once
 
     def test_setup_changes_what_the_installer_asked(self):
         data_dir = self.history()

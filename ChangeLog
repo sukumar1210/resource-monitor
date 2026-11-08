@@ -1,10 +1,15 @@
 What's new in version 0.2.12
 
-* Opt-in metrics: temperature (the hottest sensor), CPU power (RAPL) and battery draw, each turned on in F2 Setup's
+* Opt-in metrics: temperature (every sensor), CPU power (RAPL) and battery draw, each turned on in F2 Setup's
   Recording section or with hmon configure --metrics, recorded from then on and graphed in a tab of its own
+* Temperature keeps every sensor, so the statistic works across them as well as over time: Average, Maximum (the
+  hottest), Minimum (the coolest) and the percentiles
+* Setup applies a recording change without root too: it asks sudo outside the screen, then comes back, and a metric
+  just turned on has its tab at once
 * An opt-in graph with no readings says why in its middle, and what would help: a virtual machine has no such
   sensors; without temperature drivers, install lm-sensors and run sudo sensors-detect
-* hmon export --sqlite and hmon sql carry the new columns (temp_c, cpu_power_w, battery_power_w)
+* hmon export --sqlite and hmon sql carry the new columns (temp_avg_c, temp_max_c, temp_min_c, cpu_power_w,
+  battery_power_w)
 
 What's new in version 0.2.11
 

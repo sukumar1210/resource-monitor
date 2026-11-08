@@ -62,7 +62,7 @@ SECRETS = [
 # Columns are only ever added at the end, and readers take the columns they know by position, so files written
 # before and after an update stay readable.
 HOST_FIELDS = ['ts', 'cpu_percent', 'load_1m', 'mem_total_bytes', 'mem_available_bytes', 'swap_used_bytes',
-               'load_5m', 'load_15m', 'swap_total_bytes', 'temp_c', 'cpu_power_w', 'battery_power_w']
+               'load_5m', 'load_15m', 'swap_total_bytes', 'temps_c', 'cpu_power_w', 'battery_power_w']
 CONTAINER_FIELDS = ['ts', 'container', 'cpu_percent', 'mem_bytes', 'mem_limit_bytes', 'net_rx_bytes',
                     'net_tx_bytes', 'block_read_bytes', 'block_write_bytes', 'pids', 'id']
 PROCESS_FIELDS = ['ts', 'pid', 'container', 'name', 'rss_bytes', 'cpu_percent', 'cmdline', 'ppid', 'cgroup']
@@ -130,12 +130,14 @@ def reading(path):
         return None
 
 
-def hottest_temperature():
-    """The hottest of the kernel's temperature sensors, in °C; None where it has none, as on virtual machines."""
-    paths = (glob.glob(os.path.join(SYS, 'class/hwmon/hwmon*/temp*_input'))
-             + glob.glob(os.path.join(SYS, 'class/thermal/thermal_zone*/temp')))
-    degrees = [value / 1000 for value in map(reading, paths) if value and 0 < value / 1000 < 150]  # millidegrees
-    return round(max(degrees), 1) if degrees else None
+def temperatures():
+    """Every temperature sensor the kernel has, in °C; none on virtual machines. The hwmon ones include the thermal
+    zones' as a rule, so those are read only where there are no hwmon ones, and nothing counts twice."""
+    def degrees(pattern):
+        values = map(reading, sorted(glob.glob(os.path.join(SYS, pattern))))
+        return [round(value / 1000, 1) for value in values if value and 0 < value / 1000 < 150]  # millidegrees
+
+    return degrees('class/hwmon/hwmon*/temp*_input') or degrees('class/thermal/thermal_zone*/temp')
 
 
 def rapl_packages():
@@ -176,9 +178,10 @@ def battery_draw():
 
 
 def sample_extras(metrics, previous_energy):
-    """[°C, CPU W, battery W] for the opted-in `metrics` (None for the rest), and the RAPL counters for next time."""
+    """[every sensor's °C joined by ;, CPU W, battery W] for the opted-in `metrics` (None for the rest), and the RAPL
+    counters for next time."""
     watts, energy = cpu_power(previous_energy) if 'cpu-power' in metrics else (None, None)
-    return [hottest_temperature() if 'temperature' in metrics else None, watts,
+    return [';'.join(f'{t:g}' for t in temperatures()) if 'temperature' in metrics else None, watts,
             battery_draw() if 'battery' in metrics else None], energy
 
 
@@ -473,8 +476,8 @@ def show_snapshot(at, csv_dir=DATA_DIR):
               f"{process_mem.get(row['pid'], ''):<30}  {row['cmdline'] or '[' + row['name'] + ']'}")
 
 
-HostSample = namedtuple('HostSample', 'cpu load_1m load_5m load_15m mem_used mem_total swap_used swap_total temp '
-                                       'cpu_power battery_power')
+HostSample = namedtuple('HostSample', 'cpu load_1m load_5m load_15m mem_used mem_total swap_used swap_total temps '
+                                       'cpu_power battery_power')  # temps: a tuple, every sensor's °C
 ProcRow = namedtuple('ProcRow', 'pid ppid container name command cgroup mem cpu')
 # Like htop, the viewer holds what's on screen rather than the history behind it.
 LIVE_HOST_SECONDS = 900  # the viewer's own live host samples kept for the graph
@@ -488,11 +491,16 @@ RELOAD_SECONDS = 30
 
 def host_sample(row):
     """A host CSV row (strings, or the collector's values) -> HostSample; columns newer than the file are None."""
-    ts, cpu, load_1m, total, available, swap_used, load_5m, load_15m, swap_total, temp, cpu_w, battery_w = \
+    ts, cpu, load_1m, total, available, swap_used, load_5m, load_15m, swap_total, temps, cpu_w, battery_w = \
         (list(row) + [''] * 12)[:12]
     return HostSample(number(cpu), number(load_1m), number(load_5m), number(load_15m),
-                      int(total) - int(available), int(total), number(swap_used), number(swap_total), number(temp),
-                      number(cpu_w), number(battery_w))
+                      int(total) - int(available), int(total), number(swap_used), number(swap_total),
+                      sensors(temps), number(cpu_w), number(battery_w))
+
+
+def sensors(text):
+    """'45;52.5' -> (45.0, 52.5): several sensors' readings in one column; None where there were none."""
+    return tuple(float(value) for value in (text or '').split(';') if value) or None
 
 
 def load_host(csv_dir):
@@ -661,9 +669,11 @@ class Stat:
 
 
 def aggregate(values, statistic):
+    """The statistic over `values`; a tuple among them (several sensors at once) counts each of its readings."""
     stat = Stat(statistic)
     for value in values:
-        stat.add(value)
+        for one in value if isinstance(value, tuple) else (value,):
+            stat.add(one)
     return stat.result()
 
 
@@ -675,7 +685,7 @@ def metric_value(sample, metric):
     if metric == 'Load':
         return sample.load_1m
     if metric in ('Temp', 'CPU W', 'Batt W'):
-        return {'Temp': sample.temp, 'CPU W': sample.cpu_power, 'Batt W': sample.battery_power}[metric]
+        return {'Temp': sample.temps, 'CPU W': sample.cpu_power, 'Batt W': sample.battery_power}[metric]
     return 100 * sample.swap_used / sample.swap_total if sample.swap_used is not None and sample.swap_total else None
 
 
@@ -1195,10 +1205,7 @@ class Viewer:
         self.glyphs = GLYPHS if unicode else ASCII_GLYPHS
         self.styles = self.make_styles(use_color and curses.has_colors())
         self.columns, self.graph_values = {}, {}  # caches, by column start and the settings that shape them
-        recorded = recording()[2]
-        self.metrics = METRICS + [tab for name, tab in EXTRA_METRICS.items()  # the opt-in ones recorded, or with data
-                                  if name in recorded or any(metric_value(sample, tab) is not None
-                                                             for sample in store.host.values())]
+        self.metrics = self.graph_tabs()
         self.statistic = settings['statistic']
         self.metric = settings['graph'] if settings['graph'] in self.metrics else 'Memory'
         self.zoom, self.delay, self.tree = int(settings['granularity']), int(settings['delay']), settings['view'] == 'tree'
@@ -1212,6 +1219,13 @@ class Viewer:
         self.live_t, self.step, self.live_cache = None, 1, (None, None)
         self.next_reload = time.monotonic() + RELOAD_SECONDS
         self.cursor = self.view_end = self.align(self.store.times[-1])
+
+    def graph_tabs(self):
+        """Memory, CPU, Load and Swap, then each opt-in metric the service records or the data has readings of."""
+        recorded = recording()[2]
+        return METRICS + [tab for name, tab in EXTRA_METRICS.items()
+                          if name in recorded or any(metric_value(sample, tab) is not None
+                                                     for sample in self.store.host.values())]
 
     @staticmethod
     def make_styles(use_color):
@@ -1534,7 +1548,7 @@ class Viewer:
         machine = virtual_machine()
         if machine:
             return f'No {what} readings: this is a virtual machine ({machine}), which has no such sensors'
-        if name == 'temperature' and hottest_temperature() is None:
+        if name == 'temperature' and not temperatures():
             if shutil.which('sensors') is None:
                 return ('No temperature readings: install lm-sensors (lm_sensors with dnf or yum), then run '
                         'sudo sensors-detect to load its drivers')
@@ -1735,7 +1749,7 @@ class Viewer:
 
     SETTINGS = ['Time zone', 'Statistic', 'Granularity', 'Graph', 'Refresh delay', 'View', 'Mouse', 'Sample every',
                 'Keep', 'Temperature', 'CPU power', 'Battery draw']
-    OPT_INS = {'Temperature': ('temperature', 'the hottest sensor, in °C'),
+    OPT_INS = {'Temperature': ('temperature', 'every sensor, in °C'),
                'CPU power': ('cpu-power', 'the CPU package, in watts (RAPL)'),
                'Battery draw': ('battery', 'watts from the battery while unplugged')}
     RECORDING = SETTINGS.index('Sample every')  # where Setup's Recording section starts
@@ -1945,8 +1959,9 @@ class Viewer:
                 except (OSError, subprocess.CalledProcessError) as error:
                     notices.append(f'Could not change the recording: {error}.')
             else:
-                notices.append(f'To record that, run: hmon configure --interval {interval} --retention {days} '
-                               f'--metrics {",".join(metrics) or "none"}')
+                notices.append(self.configure_as_root(['configure', '--interval', str(interval), '--retention', str(days),
+                                                       '--metrics', ','.join(metrics) or 'none']))
+            self.metrics = self.graph_tabs()  # a metric just turned on gets its tab
         try:
             save_settings(self.settings())
             notices.append(f'Settings saved to {CONFIG_PATH}.')
@@ -1954,6 +1969,21 @@ class Viewer:
             notices.append(f'Could not save the settings: {error}.')
         self.notice = '  '.join(notices)
         self.blocking(False)
+
+    def configure_as_root(self, args):
+        """Runs `hmon ARGS` under sudo, outside the screen so sudo can ask for a password, then comes back; says how
+        it went."""
+        curses.endwin()
+        print(f'Changing the recording needs root: sudo hmon {" ".join(args)}', flush=True)
+        try:
+            done = subprocess.run(['sudo', sys.executable, os.path.abspath(sys.argv[0])] + args).returncode == 0
+        except (OSError, KeyboardInterrupt):  # no sudo, or Ctrl+C at its password prompt
+            done = False
+        self.screen.clear()  # back on the screen: everything is drawn again
+        self.apply_mouse()
+        if done:
+            return 'The recording changed; the hmon service restarted.'
+        return f'The recording is unchanged: sudo didn\'t run it. To change it, run: hmon {" ".join(args)}'
 
     def pick_sort(self):
         """htop's Sort by panel."""
@@ -2388,7 +2418,7 @@ def write_dump(csv_dir, start, end, output):
 SCHEMA = '''
 CREATE TABLE host (ts TEXT, time INTEGER, cpu_percent REAL, load_1m REAL, load_5m REAL, load_15m REAL,
                    mem_total INTEGER, mem_available INTEGER, mem_used INTEGER, swap_used INTEGER, swap_total INTEGER,
-                   temp_c REAL, cpu_power_w REAL, battery_power_w REAL);
+                   temp_avg_c REAL, temp_max_c REAL, temp_min_c REAL, cpu_power_w REAL, battery_power_w REAL);
 CREATE TABLE containers (ts TEXT, time INTEGER, container TEXT, cpu_percent REAL, mem INTEGER, mem_limit INTEGER,
                          net_rx INTEGER, net_tx INTEGER, block_read INTEGER, block_write INTEGER, pids INTEGER);
 CREATE TABLE processes (ts TEXT, time INTEGER, pid INTEGER, ppid INTEGER, app TEXT, container TEXT, name TEXT,
@@ -2402,16 +2432,18 @@ def to_sqlite(csv_dir, start, end, path):
     """The samples in [start, end] as SQLite tables host, containers and processes; each process row carries the
     app hmon groups it under, so `GROUP BY app` works."""
     def host_values(row):
-        ts, cpu, load_1m, total, available, swap_used, load_5m, load_15m, swap_total, temp, cpu_w, battery_w = \
+        ts, cpu, load_1m, total, available, swap_used, load_5m, load_15m, swap_total, temps, cpu_w, battery_w = \
             (row + [''] * 12)[:12]
+        degrees = sensors(temps) or ()
         return (ts, to_second(ts), number(cpu), number(load_1m), number(load_5m), number(load_15m), int(total),
-                int(available), int(total) - int(available), number(swap_used), number(swap_total), number(temp),
-                number(cpu_w), number(battery_w))
+                int(available), int(total) - int(available), number(swap_used), number(swap_total),
+                round(sum(degrees) / len(degrees), 2) if degrees else None, max(degrees, default=None),
+                min(degrees, default=None), number(cpu_w), number(battery_w))
 
     connection = sqlite3.connect(path)
     connection.executescript(SCHEMA)
     for _, csv_path in files_in_range(csv_dir, 'host', start, end):
-        connection.executemany('INSERT INTO host VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+        connection.executemany('INSERT INTO host VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
                                (host_values(row) for row in rows_in_range(csv_path, start, end)))
     for _, csv_path in files_in_range(csv_dir, 'containers', start, end):
         connection.executemany('INSERT INTO containers VALUES (?,?,?,?,?,?,?,?,?,?,?)',
