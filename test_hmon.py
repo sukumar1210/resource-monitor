@@ -1,6 +1,8 @@
 """End-to-end checks: collect from a fake host, browse with the real viewer, export and query. `python3 -m unittest`"""
 import base64
 import contextlib
+import csv
+import glob
 import io
 import itertools
 import os
@@ -86,6 +88,20 @@ def proc_files(pid, ppid, command, cgroup, rss, ticks, start='100'):
     name = os.path.basename(command.split(' ')[0]) or 'kworker'
     return {f'/proc/{pid}/stat': f'{pid} ({name[:15]}) ' + ' '.join(stat),
             f'/proc/{pid}/cgroup': f'0::{cgroup}\n', f'/proc/{pid}/cmdline': command.replace(' ', '\0')}
+
+
+def fake_sys(root, energy):
+    """A /sys with a hwmon sensor, a thermal zone, a CPU package's RAPL counter (and a core part inside it, not to be
+    counted again) and a discharging battery."""
+    files = {'class/hwmon/hwmon0/temp1_input': '45000', 'class/thermal/thermal_zone0/temp': '52000',
+             'class/powercap/intel-rapl:0/name': 'package-0', 'class/powercap/intel-rapl:0/energy_uj': str(energy),
+             'class/powercap/intel-rapl:0/max_energy_range_uj': '262143328850',
+             'class/powercap/intel-rapl:0:0/name': 'core', 'class/powercap/intel-rapl:0:0/energy_uj': '7',
+             'class/power_supply/BAT0/status': 'Discharging', 'class/power_supply/BAT0/power_now': '12500000'}
+    for path, text in files.items():
+        os.makedirs(os.path.dirname(os.path.join(root, path)), exist_ok=True)
+        with open(os.path.join(root, path), 'w') as f:
+            f.write(text + '\n')
 
 
 class Live:
@@ -427,6 +443,61 @@ class EndToEnd(unittest.TestCase):
             hmon.main(['update'])
         self.assertIn('hmon 0.2.5 is up to date.', out.getvalue())
 
+    def test_opt_in_metrics_are_recorded_and_graphed(self):
+        data_dir, sys_dir = os.path.join(self.dir.name, 'data'), os.path.join(self.dir.name, 'sys')
+        fake_sys(sys_dir, energy=1000000)
+        proc = {'/proc/stat': 'cpu 100 0 50 800 50 0 0 0 0 0\n', '/proc/loadavg': '0.50 0.40 0.30 1/200 999\n',
+                '/proc/meminfo': 'MemTotal: 8000000 kB\nMemAvailable: 3000000 kB\nSwapTotal: 0 kB\nSwapFree: 0 kB\n'}
+        real_open, steps = open, iter([lambda: fake_sys(sys_dir, energy=121000000), Stop])
+
+        def sleep(seconds):  # between the two samples the package uses 120 J; then the collector is stopped
+            step = next(steps)
+            if step is Stop:
+                raise Stop
+            step()
+
+        with mock.patch.object(hmon, 'DATA_DIR', data_dir), mock.patch.object(hmon, 'SYS', sys_dir), \
+                mock.patch.dict(os.environ, {'HMON_METRICS': 'temperature,cpu-power,battery'}), \
+                mock.patch.object(hmon.os, 'listdir', return_value=[]), \
+                mock.patch.object(hmon.shutil, 'which', return_value=None), \
+                mock.patch.object(hmon, 'open', create=True,
+                                  side_effect=lambda path, *a, **k: io.StringIO(proc[path]) if path in proc
+                                  else real_open(path, *a, **k)), \
+                mock.patch.object(hmon.time, 'monotonic', side_effect=itertools.count(0, 30)), \
+                mock.patch.object(hmon.time, 'sleep', side_effect=sleep), self.assertRaises(Stop):
+            hmon.main(['collect'])
+        with open(glob.glob(os.path.join(data_dir, 'host_*.csv'))[0]) as f:
+            rows = list(csv.reader(f))
+        self.assertEqual(rows[0][-3:], ['temp_c', 'cpu_power_w', 'battery_power_w'])
+        self.assertEqual(rows[2][-3:], ['52.0', '1.0', '12.5'])  # the hottest sensor; 120 J in 120 s; 12.5 W out
+
+        with mock.patch.object(hmon, 'UNIT_PATH', os.path.join(self.dir.name, 'none.service')):
+            frames = browse(data_dir, [ord('\t')] * 6)
+        self.assertIn(' Swap   Temp   CPU W   Batt W ', frames[0])  # tabs for the metrics with readings
+        self.assertIn(' 100°', frames[4])
+        self.assertIn('   2W', frames[5])  # watts scale to the most in view
+        self.assertIn('  14W', frames[6])
+
+    def test_an_empty_opt_in_graph_says_why(self):
+        data_dir = self.history()  # recorded before any opt-in
+        unit, rule = os.path.join(self.dir.name, 'hmon.service'), os.path.join(self.dir.name, 'hmon.conf')
+        with open(unit, 'w') as f:
+            f.write('[Service]\nEnvironment=HMON_INTERVAL=60\nEnvironment=HMON_METRICS=battery,cpu-power,temperature\n')
+        with open(rule, 'w') as f:
+            f.write('d /var/lib/hmon 0755 root root 14d\n')
+        bare = os.path.join(self.dir.name, 'sys')  # a laptop whose sensor drivers aren't loaded, without lm-sensors
+        os.makedirs(bare)
+        with mock.patch.object(hmon, 'UNIT_PATH', unit), mock.patch.object(hmon, 'TMPFILES_PATH', rule), \
+                mock.patch.object(hmon, 'SYS', bare), mock.patch.object(hmon.shutil, 'which', return_value=None):
+            with mock.patch.object(hmon, 'virtual_machine', return_value=''):
+                laptop = browse(data_dir, [ord('\t')] * 6, sampler=Live())
+            with mock.patch.object(hmon, 'virtual_machine', return_value='amazon'):
+                ec2 = browse(data_dir, [ord('\t')] * 4, sampler=Live())
+        self.assertIn('No temperature readings: install lm-sensors', laptop[4])  # in the middle of the empty graph
+        self.assertIn('No CPU power readings: this CPU or kernel has no RAPL energy counters', laptop[5])
+        self.assertIn('No battery here', laptop[6])
+        self.assertIn('No temperature readings: this is a virtual machine (amazon), which has no such sensors', ec2[4])
+
     def test_setup_changes_what_the_installer_asked(self):
         data_dir = self.history()
         unit, rule = os.path.join(self.dir.name, 'hmon.service'), os.path.join(self.dir.name, 'hmon.conf')
@@ -449,10 +520,12 @@ class EndToEnd(unittest.TestCase):
         self.assertRegex(frames[1], r'Sample every\s+60 s\s+about [\d,]+ MB a day')
         self.assertRegex(frames[1], r'Keep\s+14 days\s+about [\d,]+ MB in all')
         self.assertRegex(frames[1], r'Mouse\s+on\s+clicks act; a drag highlights text and copies it')
+        self.assertRegex(frames[1], r'Temperature\s+off\s+not recorded')  # the opt-in metrics, in Recording
+        self.assertRegex(frames[1], r'Battery draw\s+off')
         self.assertRegex(frames[8], r'Mouse\s+off\s+the terminal selects text')  # Right steps through the choices
         self.assertRegex(frames[10], r'Sample every\s+30 s')
         self.assertRegex(frames[13], r'7 days\s+about [\d,]+ MB in all')  # the retention dropdown, filtered
-        self.assertIn('Recording every 30 s, kept 7 days; the hmon service restarted.', frames[15])
+        self.assertIn('Recording every 30 s, kept 7 days, with no opt-in metrics; the hmon service restarted.', frames[15])
         with open(hmon.CONFIG_PATH) as f:
             self.assertIn('mouse=off', f.read())
         with open(unit) as f:
@@ -460,7 +533,15 @@ class EndToEnd(unittest.TestCase):
         with open(rule) as f:
             self.assertEqual(f.read(), 'd /var/lib/hmon 0755 root root 7d\n')
         run.assert_any_call(['systemctl', 'restart', 'hmon'], check=True)
-        self.assertIn('Recording every 30 s, kept 7 days.', out.getvalue())
+        self.assertIn('Recording every 30 s, kept 7 days, with no opt-in metrics.', out.getvalue())
+
+        with mock.patch.object(hmon, 'UNIT_PATH', unit), mock.patch.object(hmon, 'TMPFILES_PATH', rule), \
+                mock.patch.object(hmon.os, 'geteuid', return_value=0), mock.patch.object(hmon.subprocess, 'run'), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            hmon.main(['configure', '--metrics', 'temperature,battery'])
+        with open(unit) as f:
+            self.assertIn('Environment=HMON_METRICS=battery,temperature\n', f.read())
+        self.assertIn('with battery, temperature; the hmon service restarted.', out.getvalue())
 
         with mock.patch.object(hmon, 'UNIT_PATH', unit), mock.patch.object(hmon, 'TMPFILES_PATH', rule), \
                 mock.patch.object(hmon.os, 'geteuid', return_value=1000), \

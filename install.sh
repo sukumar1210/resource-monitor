@@ -51,6 +51,8 @@ step() {  # step MESSAGE: what the installer is doing now, so a slow step shows 
 # How often to sample and how long to keep it. An update keeps the earlier answers; only a new install asks.
 previous_interval=$(sed -n 's|^Environment=HMON_INTERVAL=\([0-9][0-9]*\)$|\1|p' /etc/systemd/system/hmon.service 2>/dev/null || true)
 previous_days=$(sed -n 's|^d /var/lib/hmon .* \([0-9][0-9]*\)d$|\1|p' /etc/tmpfiles.d/hmon.conf 2>/dev/null || true)
+previous_metrics=$(sed -n 's|^Environment=HMON_METRICS=\(.*\)$|\1|p' /etc/systemd/system/hmon.service 2>/dev/null || true)
+METRICS=${METRICS:-$previous_metrics}  # opt-in metrics, chosen in hmon's Setup or with hmon configure --metrics
 if [ -n "$previous_interval" ] && [ -n "$previous_days" ]; then
     INTERVAL=${INTERVAL:-$previous_interval}
     RETENTION_DAYS=${RETENTION_DAYS:-$previous_days}
@@ -122,6 +124,7 @@ After=docker.service
 
 [Service]
 Environment=HMON_INTERVAL=${INTERVAL}
+Environment=HMON_METRICS=${METRICS}
 ExecStart=/usr/local/bin/hmon collect
 Restart=always
 RestartSec=10

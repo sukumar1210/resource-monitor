@@ -125,6 +125,14 @@ disk each choice takes on this host. Changing them rewrites the hmon service and
 when you leave Setup; otherwise Setup shows the command, which also works on its own and asks for sudo:
 `hmon configure --interval 10 --retention 3` (`hmon configure` alone prints the current values).
 
+**Opt-in metrics.** The Recording section also turns on three host readings the kernel has on most laptops and
+desktops, recorded only once you opt in: **Temperature** (the hottest sensor, °C), **CPU power** (the CPU package's
+watts, from its RAPL energy counters) and **Battery draw** (watts from the battery while unplugged; 0 on AC). Each
+adds a graph tab after Swap. From the command line: `hmon configure --metrics temperature,cpu-power,battery` (or
+`none`); updates keep the choice. Where a graph has no readings, it says why in its middle: a virtual machine (such
+as EC2) has no such sensors; a machine whose temperature drivers aren't loaded is told to install lm-sensors and run
+`sudo sensors-detect`. CPU power needs root to read, so the live column of that graph stays empty for other users.
+
 Options, as in htop: `-C` monochrome (also `NO_COLOR`), `-U` ASCII only, `-F FILTER`, `-s COLUMN`, `-d DELAY`
 (tenths of a second for the live refresh), `-M` no mouse, `-V` version.
 

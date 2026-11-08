@@ -24,6 +24,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import textwrap
 import threading
 import time
 import urllib.request
@@ -61,7 +62,7 @@ SECRETS = [
 # Columns are only ever added at the end, and readers take the columns they know by position, so files written
 # before and after an update stay readable.
 HOST_FIELDS = ['ts', 'cpu_percent', 'load_1m', 'mem_total_bytes', 'mem_available_bytes', 'swap_used_bytes',
-               'load_5m', 'load_15m', 'swap_total_bytes']
+               'load_5m', 'load_15m', 'swap_total_bytes', 'temp_c', 'cpu_power_w', 'battery_power_w']
 CONTAINER_FIELDS = ['ts', 'container', 'cpu_percent', 'mem_bytes', 'mem_limit_bytes', 'net_rx_bytes',
                     'net_tx_bytes', 'block_read_bytes', 'block_write_bytes', 'pids', 'id']
 PROCESS_FIELDS = ['ts', 'pid', 'container', 'name', 'rss_bytes', 'cpu_percent', 'cmdline', 'ppid', 'cgroup']
@@ -114,6 +115,82 @@ def sample_host(ts, prev_cpu_ticks):
     row = [ts, cpu_percent, load_1m, mem['MemTotal'], mem['MemAvailable'], mem['SwapTotal'] - mem['SwapFree'],
            load_5m, load_15m, mem['SwapTotal']]
     return row, cpu_ticks
+
+
+SYS = '/sys'  # where the kernel keeps its sensors; tests point it at a folder of their own
+# Opt-in host metrics, recorded only when the service lists them in HMON_METRICS: name -> the graph's tab
+EXTRA_METRICS = {'temperature': 'Temp', 'cpu-power': 'CPU W', 'battery': 'Batt W'}
+
+
+def reading(path):
+    """A number from a sysfs file, or None."""
+    try:
+        return float(read_text(path))
+    except ValueError:
+        return None
+
+
+def hottest_temperature():
+    """The hottest of the kernel's temperature sensors, in °C; None where it has none, as on virtual machines."""
+    paths = (glob.glob(os.path.join(SYS, 'class/hwmon/hwmon*/temp*_input'))
+             + glob.glob(os.path.join(SYS, 'class/thermal/thermal_zone*/temp')))
+    degrees = [value / 1000 for value in map(reading, paths) if value and 0 < value / 1000 < 150]  # millidegrees
+    return round(max(degrees), 1) if degrees else None
+
+
+def rapl_packages():
+    """The CPU packages' RAPL energy counters (Intel, and AMD on recent kernels), not their core or DRAM parts."""
+    return [domain for domain in sorted(glob.glob(os.path.join(SYS, 'class/powercap/intel-rapl:*')))
+            if os.path.basename(domain).count(':') == 1 and read_text(os.path.join(domain, 'name')).startswith('package')]
+
+
+def cpu_power(previous):
+    """(watts the CPU packages drew since `previous`, the counters now for next time), from RAPL energy counters;
+    the first call, and hosts or users that can't read them, give None watts."""
+    now = time.monotonic(), {domain: (reading(os.path.join(domain, 'energy_uj')),
+                                      reading(os.path.join(domain, 'max_energy_range_uj')) or 0)
+                             for domain in rapl_packages()}
+    if not previous or not now[1] or now[0] <= previous[0]:
+        return None, now
+    joules = 0.0
+    for domain, (energy, wrap) in now[1].items():
+        before = previous[1].get(domain, (None, 0))[0]
+        if energy is None or before is None:
+            return None, now
+        joules += ((energy - before) % wrap if wrap else energy - before) / 1e6  # counters wrap at max_energy_range
+    return round(joules / (now[0] - previous[0]), 2), now
+
+
+def battery_draw():
+    """Watts drawn from the batteries while they discharge, 0 while charging or full; None without a battery."""
+    total = None
+    for battery in glob.glob(os.path.join(SYS, 'class/power_supply/BAT*')):
+        microwatts = reading(os.path.join(battery, 'power_now'))
+        if microwatts is None:  # some batteries report current and voltage instead
+            amps, volts = reading(os.path.join(battery, 'current_now')), reading(os.path.join(battery, 'voltage_now'))
+            microwatts = amps * volts / 1e6 if amps is not None and volts is not None else None
+        if microwatts is not None:
+            discharging = read_text(os.path.join(battery, 'status')).strip() == 'Discharging'
+            total = (total or 0.0) + (microwatts / 1e6 if discharging else 0.0)
+    return None if total is None else round(total, 2)
+
+
+def sample_extras(metrics, previous_energy):
+    """[°C, CPU W, battery W] for the opted-in `metrics` (None for the rest), and the RAPL counters for next time."""
+    watts, energy = cpu_power(previous_energy) if 'cpu-power' in metrics else (None, None)
+    return [hottest_temperature() if 'temperature' in metrics else None, watts,
+            battery_draw() if 'battery' in metrics else None], energy
+
+
+@lru_cache(maxsize=None)
+def virtual_machine():
+    """The hypervisor's name where this is a virtual machine, which has no temperature or power sensors; else ''."""
+    try:
+        out = subprocess.run(['systemd-detect-virt', '--vm'], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                             universal_newlines=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return ''
+    return out.stdout.strip() if out.returncode == 0 else ''
 
 
 def sample_containers(ts):
@@ -190,13 +267,17 @@ def collect():
     os.umask(0o022)  # readable by everyone, like /proc; the installer makes the directory root-only where /proc is
     os.makedirs(DATA_DIR, exist_ok=True)
     has_docker = shutil.which('docker') is not None
-    prev_cpu_ticks, prev_procs, container_names = None, None, {}
+    prev_cpu_ticks, prev_procs, container_names, prev_energy = None, None, {}, None
+    metrics = [name for name in os.environ.get('HMON_METRICS', '').split(',') if name in EXTRA_METRICS]
     while True:
         started = time.monotonic()
         now = datetime.now(timezone.utc)
         ts, day = now.strftime('%Y-%m-%dT%H:%M:%SZ'), now.strftime('%Y-%m-%d')
         try:
             row, prev_cpu_ticks = sample_host(ts, prev_cpu_ticks)
+            if metrics:
+                extras, prev_energy = sample_extras(metrics, prev_energy)
+                row += extras
             append('host', HOST_FIELDS, [row], day)
         except Exception:
             logging.exception('host sample failed')
@@ -392,7 +473,8 @@ def show_snapshot(at, csv_dir=DATA_DIR):
               f"{process_mem.get(row['pid'], ''):<30}  {row['cmdline'] or '[' + row['name'] + ']'}")
 
 
-HostSample = namedtuple('HostSample', 'cpu load_1m load_5m load_15m mem_used mem_total swap_used swap_total')
+HostSample = namedtuple('HostSample', 'cpu load_1m load_5m load_15m mem_used mem_total swap_used swap_total temp '
+                                       'cpu_power battery_power')
 ProcRow = namedtuple('ProcRow', 'pid ppid container name command cgroup mem cpu')
 # Like htop, the viewer holds what's on screen rather than the history behind it.
 LIVE_HOST_SECONDS = 900  # the viewer's own live host samples kept for the graph
@@ -406,9 +488,11 @@ RELOAD_SECONDS = 30
 
 def host_sample(row):
     """A host CSV row (strings, or the collector's values) -> HostSample; columns newer than the file are None."""
-    ts, cpu, load_1m, total, available, swap_used, load_5m, load_15m, swap_total = (list(row) + [''] * 9)[:9]
+    ts, cpu, load_1m, total, available, swap_used, load_5m, load_15m, swap_total, temp, cpu_w, battery_w = \
+        (list(row) + [''] * 12)[:12]
     return HostSample(number(cpu), number(load_1m), number(load_5m), number(load_15m),
-                      int(total) - int(available), int(total), number(swap_used), number(swap_total))
+                      int(total) - int(available), int(total), number(swap_used), number(swap_total), number(temp),
+                      number(cpu_w), number(battery_w))
 
 
 def load_host(csv_dir):
@@ -516,7 +600,8 @@ class LiveSampler:
 
     def __init__(self, store):
         self.store = store
-        self.prev_ticks = self.prev_procs = None
+        self.prev_ticks = self.prev_procs = self.prev_energy = None
+        self.metrics = recording()[2]  # the opt-in ones the service records, read here too where this user can
 
     def sample(self):
         """(time, host row, process rows) for now; CPU % is over the time since the previous call."""
@@ -527,6 +612,9 @@ class LiveSampler:
         for _, rows in day.samples(max(0, len(day.times) - 1), len(day.times), 1):  # the latest docker stats
             names.update((field(row, 10), row[1]) for row in rows if field(row, 10))
         host_row, self.prev_ticks = sample_host(ts, self.prev_ticks)
+        if self.metrics:
+            extras, self.prev_energy = sample_extras(self.metrics, self.prev_energy)
+            host_row += extras
         rows, self.prev_procs = sample_processes(ts, self.prev_procs, names)
         return int(now.timestamp()), host_row, rows
 
@@ -586,6 +674,8 @@ def metric_value(sample, metric):
         return sample.cpu
     if metric == 'Load':
         return sample.load_1m
+    if metric in ('Temp', 'CPU W', 'Batt W'):
+        return {'Temp': sample.temp, 'CPU W': sample.cpu_power, 'Batt W': sample.battery_power}[metric]
     return 100 * sample.swap_used / sample.swap_total if sample.swap_used is not None and sample.swap_total else None
 
 
@@ -1021,22 +1111,28 @@ def zone_label(name):
 
 
 def recording():
-    """(seconds between samples, days kept) of the installed service, or (None, None) where it isn't installed."""
+    """(seconds between samples, days kept, opt-in metrics) of the installed service; (None, None, []) where it
+    isn't installed."""
     unit = read_text(UNIT_PATH)
     if not unit:
-        return None, None
+        return None, None, []
     interval = re.search(r'^Environment=HMON_INTERVAL=(\d+)$', unit, re.M)
     days = re.search(r' (\d+)d$', read_text(TMPFILES_PATH).strip())
-    return int(interval.group(1)) if interval else 60, int(days.group(1)) if days else 14
+    metrics = re.search(r'^Environment=HMON_METRICS=(.*)$', unit, re.M)
+    return (int(interval.group(1)) if interval else 60, int(days.group(1)) if days else 14,
+            sorted(name for name in (metrics.group(1).split(',') if metrics else []) if name in EXTRA_METRICS))
 
 
-def configure_recording(interval, days):
-    """Rewrites the service's sampling interval and the retention, then restarts the collector. Needs root."""
+def configure_recording(interval, days, metrics):
+    """Rewrites the service's sampling interval and opt-in metrics and the retention, then restarts the collector.
+    Needs root."""
     unit = read_text(UNIT_PATH)
-    if re.search(r'^Environment=HMON_INTERVAL=', unit, re.M):
-        unit = re.sub(r'^Environment=HMON_INTERVAL=\d+$', f'Environment=HMON_INTERVAL={interval}', unit, flags=re.M)
-    else:
-        unit = unit.replace('[Service]\n', f'[Service]\nEnvironment=HMON_INTERVAL={interval}\n', 1)
+    for name, value in (('HMON_INTERVAL', interval), ('HMON_METRICS', ','.join(sorted(metrics)))):
+        line = f'Environment={name}={value}'
+        if re.search(rf'^Environment={name}=', unit, re.M):
+            unit = re.sub(rf'^Environment={name}=.*$', line, unit, flags=re.M)
+        else:
+            unit = unit.replace('[Service]\n', f'[Service]\n{line}\n', 1)
     rule = re.sub(r' \d+d$', f' {days}d', read_text(TMPFILES_PATH).strip()) + '\n'  # read before opening to write
     with open(UNIT_PATH, 'w') as f:
         f.write(unit)
@@ -1051,7 +1147,8 @@ def megabytes_per_day(interval, processes):
 DEFAULTS = {'tz': 'system', 'statistic': 'Average', 'granularity': '60', 'graph': 'Memory', 'delay': '15',
             'view': 'tree', 'sort': 'MEM%', 'mouse': 'on'}
 VALID = {'tz': valid_zone, 'statistic': lambda v: v in STATISTICS,
-         'granularity': lambda v: v.isdigit() and int(v) in ZOOM_LEVELS, 'graph': lambda v: v in METRICS,
+         'granularity': lambda v: v.isdigit() and int(v) in ZOOM_LEVELS,
+         'graph': lambda v: v in METRICS or v in EXTRA_METRICS.values(),
          'delay': lambda v: v.isdigit() and int(v) > 0, 'view': lambda v: v in ('tree', 'list'),
          'sort': lambda v: v in SORT_COLUMNS, 'mouse': lambda v: v in ('on', 'off')}
 
@@ -1098,7 +1195,12 @@ class Viewer:
         self.glyphs = GLYPHS if unicode else ASCII_GLYPHS
         self.styles = self.make_styles(use_color and curses.has_colors())
         self.columns, self.graph_values = {}, {}  # caches, by column start and the settings that shape them
-        self.statistic, self.metric = settings['statistic'], settings['graph']
+        recorded = recording()[2]
+        self.metrics = METRICS + [tab for name, tab in EXTRA_METRICS.items()  # the opt-in ones recorded, or with data
+                                  if name in recorded or any(metric_value(sample, tab) is not None
+                                                             for sample in store.host.values())]
+        self.statistic = settings['statistic']
+        self.metric = settings['graph'] if settings['graph'] in self.metrics else 'Memory'
         self.zoom, self.delay, self.tree = int(settings['granularity']), int(settings['delay']), settings['view'] == 'tree'
         self.sort_key = settings['sort']
         self.descending = SORT_COLUMNS[self.sort_key]
@@ -1369,7 +1471,7 @@ class Viewer:
     def draw_graph(self, top, graph_h):
         g = self.glyphs
         x = 1
-        for metric in METRICS:
+        for metric in self.metrics:
             tab_x = x
             x = self.put_segments(top, x, [(f' {metric} ', 'tab' if metric == self.metric else 'normal'), (' ', 'normal')])
             self.regions.append((top, top, tab_x, x - 1, lambda cx, cy, m=metric: self.set_metric(m)))
@@ -1386,6 +1488,11 @@ class Viewer:
         if self.metric == 'Load':  # load has no ceiling: scale to the busiest column in view
             ceiling = float(math.ceil(max([1.0] + [v for v in values if v is not None])))
             marks = (f'{ceiling:g}', f'{ceiling / 2:g}', '0')
+        elif self.metric in ('CPU W', 'Batt W'):  # nor have watts; an even ceiling keeps the middle mark whole
+            ceiling = float(2 * math.ceil(max([1.0] + [v for v in values if v is not None]) / 2))
+            marks = (f'{ceiling:g}W', f'{ceiling / 2:g}W', '0W')
+        elif self.metric == 'Temp':
+            ceiling, marks = 100.0, ('100°', '50°', '0°')
         else:
             ceiling, marks = 100.0, ('100%', '50%', '0%')
         axis = top + 1 + graph_h
@@ -1410,6 +1517,33 @@ class Viewer:
                 self.put(axis, 6 + col, g['range'], 'marker')
             if (start + self.shift) % LABEL_EVERY[self.zoom] == 0:
                 self.put(axis + 1, 6 + col, label(start, time_format), 'shadow')
+        if self.metric in EXTRA_METRICS.values() and all(value is None for value in values):
+            lines = textwrap.wrap(self.no_readings(self.metric), max(10, self.graph_w - 4))
+            for i, line in enumerate(lines):  # in the middle of the empty graph
+                self.put(top + 1 + (graph_h - len(lines)) // 2 + i, 6 + (self.graph_w - len(line)) // 2, line, 'value')
+
+    def no_readings(self, metric):
+        """Why an opt-in graph has nothing in view, and what would change that, if anything can."""
+        name = next(name for name, tab in EXTRA_METRICS.items() if tab == metric)
+        what = {'temperature': 'temperature', 'cpu-power': 'CPU power', 'battery': 'battery'}[name]
+        interval, _, recorded = recording()
+        if interval is not None and name not in recorded:
+            return f'No {what} readings: turn them on in F2 Setup, under Recording'
+        if self.sampler is None:  # a dump, or another machine's data: this machine's sensors say nothing about it
+            return f'No {what} readings in this window'
+        machine = virtual_machine()
+        if machine:
+            return f'No {what} readings: this is a virtual machine ({machine}), which has no such sensors'
+        if name == 'temperature' and hottest_temperature() is None:
+            if shutil.which('sensors') is None:
+                return ('No temperature readings: install lm-sensors (lm_sensors with dnf or yum), then run '
+                        'sudo sensors-detect to load its drivers')
+            return 'No temperature readings: no sensor drivers are loaded; sudo sensors-detect may find some'
+        if name == 'cpu-power' and not rapl_packages():
+            return 'No CPU power readings: this CPU or kernel has no RAPL energy counters'
+        if name == 'battery' and not glob.glob(os.path.join(SYS, 'class/power_supply/BAT*')):
+            return 'No battery here'
+        return f'No {what} readings in this window yet'
 
     def draw_table(self, top, available, width, host):
         rows = self.rows
@@ -1580,7 +1714,7 @@ class Viewer:
         left = [(g['left_right'], 'move the marker one column'), ('S-' + g['left_right'], 'move a screen width'),
                 ('^ ^A', 'oldest sample'), ('$ ^E', 'newest sample (live)'), ('g', 'go to 12/10/2026 14:30 IST'),
                 ('[ ]', 'coarser / finer: 10 s .. 1 day'), ('s', 'statistic: avg max min p50/90/99'),
-                ('Tab S-Tab', 'graph: memory, CPU, load, swap'), ('Space', 'a range of bars, a table column each'),
+                ('Tab S-Tab', 'graph: memory, CPU, load, swap, opt-ins'), ('Space', 'a range of bars, a table column each'),
                 ('Esc', 'back to one bar'), ('F2', 'setup: zone, defaults, recording')]
         right = [(g['up_down'], 'select a row'), ('PgUp PgDn', 'page through the rows'), ('Home End', 'first / last row'),
                  ('+ -', 'unfold / fold the selected app'), ('Enter', 'unfold or fold it'),
@@ -1600,7 +1734,10 @@ class Viewer:
         self.blocking(False)
 
     SETTINGS = ['Time zone', 'Statistic', 'Granularity', 'Graph', 'Refresh delay', 'View', 'Mouse', 'Sample every',
-                'Keep']
+                'Keep', 'Temperature', 'CPU power', 'Battery draw']
+    OPT_INS = {'Temperature': ('temperature', 'the hottest sensor, in °C'),
+               'CPU power': ('cpu-power', 'the CPU package, in watts (RAPL)'),
+               'Battery draw': ('battery', 'watts from the battery while unplugged')}
     RECORDING = SETTINGS.index('Sample every')  # where Setup's Recording section starts
 
     @classmethod
@@ -1626,16 +1763,19 @@ class Viewer:
         if name == 'Granularity':
             return ZOOM_LEVELS, self.zoom, lambda z: f'{ZOOM_NAMES[z]} per column', lambda z: f'{ZOOM_NAMES[z]} per column'
         if name == 'Graph':
-            return METRICS, self.metric, str, str
+            return self.metrics, self.metric, str, str
         if name == 'Refresh delay':
             return DELAYS, self.delay, lambda d: f'{d / 10:g} s', lambda d: f'{d / 10:g} s between live samples'
         if name == 'View':
             return ['tree', 'list'], 'tree' if self.tree else 'list', str, str
         if name == 'Mouse':
             return ['on', 'off'], 'on' if self.mouse_on else 'off', str, self.mouse_text
-        interval, days = self.recording
+        interval, days, metrics = self.recording
         if interval is None:
             return [], None, str, str
+        if name in self.OPT_INS:
+            metric, meaning = self.OPT_INS[name]
+            return ['on', 'off'], 'on' if metric in metrics else 'off', str, lambda v: f'{v}   {meaning}'
         if name == 'Sample every':
             return (INTERVALS, interval, lambda s: f'{s} s',
                     lambda s: f'{s} s'.ljust(8) + f'about {disk(s):,.0f} MB a day')
@@ -1644,8 +1784,10 @@ class Viewer:
 
     def setting_text(self, name):
         options, current, short, _ = self.setting_options(name)
-        if name in ('Sample every', 'Keep') and current is None:
+        if (name in ('Sample every', 'Keep') or name in self.OPT_INS) and current is None:
             return 'the hmon service is not installed here'
+        if name in self.OPT_INS:
+            return f'{current}   ' + (f'records {self.OPT_INS[name][1]}' if current == 'on' else 'not recorded')
         if name == 'Time zone':
             return f'{self.tz}   ({zone_label(self.tz)})'
         if name == 'Mouse':
@@ -1675,8 +1817,11 @@ class Viewer:
             self.apply_mouse()
         elif name == 'Sample every':
             self.recording[0] = value
-        else:
+        elif name == 'Keep':
             self.recording[1] = value
+        else:  # an opt-in metric: a new list, so Setup can tell it from the installed one
+            metric = self.OPT_INS[name][0]
+            self.recording[2] = sorted(set(self.recording[2]) | {metric} if value == 'on' else set(self.recording[2]) - {metric})
 
     def choose(self, y, x, title, options, current, describe=str, backdrop=None):
         """A dropdown at (y, x) over what `backdrop()` draws: arrows, PgUp/PgDn, Home/End or the wheel move, typing
@@ -1791,16 +1936,17 @@ class Viewer:
                         self.apply_setting(names[choice], value)
         notices = []
         if self.recording[0] is not None and tuple(self.recording) != installed:
-            interval, days = self.recording
+            interval, days, metrics = self.recording
             if os.geteuid() == 0:
                 try:
-                    configure_recording(interval, days)
-                    notices.append(f'Recording every {interval} s, kept {days} days; the hmon service restarted.')
+                    configure_recording(interval, days, metrics)
+                    notices.append(f'Recording every {interval} s, kept {days} days, with '
+                                   f'{", ".join(metrics) or "no opt-in metrics"}; the hmon service restarted.')
                 except (OSError, subprocess.CalledProcessError) as error:
                     notices.append(f'Could not change the recording: {error}.')
             else:
-                notices.append(f'To record every {interval} s and keep {days} days, run: '
-                               f'hmon configure --interval {interval} --retention {days}')
+                notices.append(f'To record that, run: hmon configure --interval {interval} --retention {days} '
+                               f'--metrics {",".join(metrics) or "none"}')
         try:
             save_settings(self.settings())
             notices.append(f'Settings saved to {CONFIG_PATH}.')
@@ -2104,7 +2250,7 @@ class Viewer:
         elif char == 'I':
             self.descending = not self.descending
         elif char == '\t' or key == curses.KEY_BTAB:  # Shift+Tab goes the other way
-            self.set_metric(cycle(METRICS, self.metric, 1 if char == '\t' else -1))
+            self.set_metric(cycle(self.metrics, self.metric, 1 if char == '\t' else -1))
         elif key == curses.KEY_MOUSE:
             return self.click()
         elif char == 's':
@@ -2241,7 +2387,8 @@ def write_dump(csv_dir, start, end, output):
 
 SCHEMA = '''
 CREATE TABLE host (ts TEXT, time INTEGER, cpu_percent REAL, load_1m REAL, load_5m REAL, load_15m REAL,
-                   mem_total INTEGER, mem_available INTEGER, mem_used INTEGER, swap_used INTEGER, swap_total INTEGER);
+                   mem_total INTEGER, mem_available INTEGER, mem_used INTEGER, swap_used INTEGER, swap_total INTEGER,
+                   temp_c REAL, cpu_power_w REAL, battery_power_w REAL);
 CREATE TABLE containers (ts TEXT, time INTEGER, container TEXT, cpu_percent REAL, mem INTEGER, mem_limit INTEGER,
                          net_rx INTEGER, net_tx INTEGER, block_read INTEGER, block_write INTEGER, pids INTEGER);
 CREATE TABLE processes (ts TEXT, time INTEGER, pid INTEGER, ppid INTEGER, app TEXT, container TEXT, name TEXT,
@@ -2255,14 +2402,16 @@ def to_sqlite(csv_dir, start, end, path):
     """The samples in [start, end] as SQLite tables host, containers and processes; each process row carries the
     app hmon groups it under, so `GROUP BY app` works."""
     def host_values(row):
-        ts, cpu, load_1m, total, available, swap_used, load_5m, load_15m, swap_total = (row + [''] * 9)[:9]
+        ts, cpu, load_1m, total, available, swap_used, load_5m, load_15m, swap_total, temp, cpu_w, battery_w = \
+            (row + [''] * 12)[:12]
         return (ts, to_second(ts), number(cpu), number(load_1m), number(load_5m), number(load_15m), int(total),
-                int(available), int(total) - int(available), number(swap_used), number(swap_total))
+                int(available), int(total) - int(available), number(swap_used), number(swap_total), number(temp),
+                number(cpu_w), number(battery_w))
 
     connection = sqlite3.connect(path)
     connection.executescript(SCHEMA)
     for _, csv_path in files_in_range(csv_dir, 'host', start, end):
-        connection.executemany('INSERT INTO host VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+        connection.executemany('INSERT INTO host VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
                                (host_values(row) for row in rows_in_range(csv_path, start, end)))
     for _, csv_path in files_in_range(csv_dir, 'containers', start, end):
         connection.executemany('INSERT INTO containers VALUES (?,?,?,?,?,?,?,?,?,?,?)',
@@ -2399,7 +2548,7 @@ def main(argv):
               '       %(prog)s [options] at "12/10/2026 14:30 IST" [SOURCE]\n'
               '       %(prog)s [options] export [--from TIME] [--to TIME] [-o FILE.tar.gz | --sqlite FILE.db] [SOURCE]\n'
               '       %(prog)s [options] sql "SELECT ..." [--from TIME] [--to TIME] [SOURCE]\n'
-              '       %(prog)s configure [--interval SECONDS] [--retention DAYS]\n'
+              '       %(prog)s configure [--interval SECONDS] [--retention DAYS] [--metrics LIST]\n'
               '       %(prog)s update\n'
               '       %(prog)s uninstall\n'
               '       %(prog)s collect',
@@ -2424,6 +2573,8 @@ def main(argv):
     parser.add_argument('--sqlite', metavar='FILE', help='export: write a SQLite database instead of a dump')
     parser.add_argument('--interval', type=int, metavar='SECONDS', help='configure: seconds between samples (root)')
     parser.add_argument('--retention', type=int, metavar='DAYS', help='configure: days of samples to keep (root)')
+    parser.add_argument('--metrics', metavar='LIST', help='configure: opt-in metrics to record, from temperature, '
+                                                          'cpu-power and battery (comma-separated, or none)')
     parser.add_argument('words', nargs='*', help=argparse.SUPPRESS)
     args = parser.parse_intermixed_args(argv)  # options may come before or after SOURCE
 
@@ -2465,19 +2616,23 @@ def main(argv):
     elif words == ['uninstall']:
         uninstall()
     elif words == ['configure']:
-        interval, days = recording()
+        interval, days, metrics = recording()
         if interval is None:
             sys.exit('The hmon service is not installed here; run the installer first.')
-        if args.interval is None and args.retention is None:
-            print(f'Recording every {interval} s, kept {days} days.')
+        if args.interval is None and args.retention is None and args.metrics is None:
+            print(f'Recording every {interval} s, kept {days} days, with {", ".join(metrics) or "no opt-in metrics"}.')
             return
         if any(value is not None and value < 1 for value in (args.interval, args.retention)):
             parser.error('--interval and --retention take a whole number above 0')
+        if args.metrics is not None:
+            metrics = sorted({name.strip() for name in args.metrics.split(',') if name.strip()} - {'none'})
+            if any(name not in EXTRA_METRICS for name in metrics):
+                parser.error(f'--metrics takes {", ".join(EXTRA_METRICS)}, comma-separated, or none')
         if os.geteuid() != 0:  # it rewrites the hmon service
             as_root(argv)
-        configure_recording(args.interval or interval, args.retention or days)
-        print(f'Recording every {args.interval or interval} s, kept {args.retention or days} days; '
-              'the hmon service restarted.')
+        configure_recording(args.interval or interval, args.retention or days, metrics)
+        print(f'Recording every {args.interval or interval} s, kept {args.retention or days} days, with '
+              f'{", ".join(metrics) or "no opt-in metrics"}; the hmon service restarted.')
     elif words[:1] == ['at'] and len(words) in (2, 3):
         show_snapshot(words[1], source(field(words, 2)))
     elif words[:1] == ['export'] and len(words) <= 2:
