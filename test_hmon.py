@@ -566,18 +566,25 @@ class EndToEnd(unittest.TestCase):
                     hmon.main(command[3:])
             return mock.Mock(returncode=0)
 
-        keys = [hmon.curses.KEY_F2] + [hmon.curses.KEY_DOWN] * 9 + [hmon.curses.KEY_RIGHT, 27]  # Temperature: on
+        to_temperature = [hmon.curses.KEY_F2] + [hmon.curses.KEY_DOWN] * 9
         with mock.patch.object(hmon, 'UNIT_PATH', unit), mock.patch.object(hmon, 'TMPFILES_PATH', rule), \
                 mock.patch.object(hmon.os, 'geteuid', return_value=1000), mock.patch.object(hmon.curses, 'endwin'), \
                 mock.patch.object(hmon.subprocess, 'run', side_effect=run) as ran, \
                 contextlib.redirect_stdout(io.StringIO()):
-            frames = browse(data_dir, keys)
-        self.assertRegex(frames[11], r'Temperature\s+on\s+records every sensor')
+            frames = browse(data_dir, to_temperature + [hmon.curses.KEY_RIGHT, hmon.curses.KEY_RIGHT, 27])
+            sudo_calls = len(ran.call_args_list)
+            hiding = browse(data_dir, to_temperature + [hmon.curses.KEY_LEFT, 27])  # on -> record only
+        self.assertRegex(frames[11], r'Temperature\s+record only\s+recorded \(every sensor, in °C\), no graph tab')
+        self.assertRegex(frames[12], r'Temperature\s+on\s+recorded \(every sensor, in °C\), with a graph tab')
         self.assertEqual(ran.call_args_list[0][0][0][:2], ['sudo', sys.executable])  # not root: sudo, off the screen
+        self.assertIn('The recording changed', frames[13])
+        self.assertIn(' Swap   Temp ', frames[13])  # and its tab is there at once
+        self.assertEqual(len(ran.call_args_list), sudo_calls)  # record only is this viewer's choice: no sudo
+        self.assertNotIn(' Temp ', hiding[-1])  # its tab is gone...
         with open(unit) as f:
-            self.assertIn('Environment=HMON_METRICS=temperature\n', f.read())  # it stuck
-        self.assertIn('The recording changed', frames[12])
-        self.assertIn(' Swap   Temp ', frames[12])  # and its tab is there at once
+            self.assertIn('Environment=HMON_METRICS=temperature\n', f.read())  # ...but it's still recorded
+        with open(hmon.CONFIG_PATH) as f:
+            self.assertIn('hidden=temperature', f.read())
 
     def test_setup_changes_what_the_installer_asked(self):
         data_dir = self.history()

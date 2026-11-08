@@ -132,8 +132,9 @@ when you leave Setup; otherwise Setup shows the command, which also works on its
 **Opt-in metrics.** The Recording section also turns on three host readings the kernel has on most laptops and
 desktops, recorded only once you opt in: **Temperature** (every sensor, °C; the statistic works across them as well
 as over time, so Maximum is the hottest and Minimum the coolest), **CPU power** (the CPU package's watts, from its
-RAPL energy counters) and **Battery draw** (watts from the battery while unplugged; 0 on AC). Each adds a graph tab
-after Swap as soon as it's on; without root, Setup asks sudo to apply it. From the command line: `hmon configure --metrics temperature,cpu-power,battery` (or
+RAPL energy counters) and **Battery draw** (watts from the battery while unplugged; 0 on AC). Each is **off** (not
+recorded), **record only** (recorded, no graph tab) or **on** (recorded, with a tab after Swap). What's recorded is the
+service's, so changing it needs root (without it, Setup asks sudo); whether its tab shows is your own setting. From the command line: `hmon configure --metrics temperature,cpu-power,battery` (or
 `none`); updates keep the choice. Where a graph has no readings, it says why in its middle: a virtual machine (such
 as EC2) has no such sensors; a machine whose temperature drivers aren't loaded is told to install lm-sensors and run
 `sudo sensors-detect`. CPU power needs root to read, so the live column of that graph stays empty for other users.

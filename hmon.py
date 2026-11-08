@@ -1055,6 +1055,15 @@ def bar_header_segments(widths, labels, marked, cell_w, descending, tree_mode, g
     return segments + [('App / Process' if tree_mode else 'Command', 'header', None)]
 
 
+OPT_IN_STATES = ['off', 'record only', 'on']  # an opt-in metric: not recorded; recorded, no graph tab; both
+
+
+def opt_in_text(state, meaning):
+    """What an opt-in metric's Setup row says of its state."""
+    return {'off': 'not recorded', 'record only': f'recorded ({meaning}), no graph tab',
+            'on': f'recorded ({meaning}), with a graph tab'}[state]
+
+
 def metric_text(metric, value):
     """A graph tab's value as its tooltip shows it."""
     if value is None:
@@ -1166,12 +1175,13 @@ def configure_recording(interval, days, metrics):
 def megabytes_per_day(interval, processes):
     return 86400 / interval * processes * SAMPLE_BYTES / 1e6
 DEFAULTS = {'tz': 'system', 'statistic': 'Average', 'granularity': '60', 'graph': 'Memory', 'delay': '15',
-            'view': 'tree', 'sort': 'MEM%', 'mouse': 'on'}
+            'view': 'tree', 'sort': 'MEM%', 'mouse': 'on', 'hidden': ''}
 VALID = {'tz': valid_zone, 'statistic': lambda v: v in STATISTICS,
          'granularity': lambda v: v.isdigit() and int(v) in ZOOM_LEVELS,
          'graph': lambda v: v in METRICS or v in EXTRA_METRICS.values(),
          'delay': lambda v: v.isdigit() and int(v) > 0, 'view': lambda v: v in ('tree', 'list'),
-         'sort': lambda v: v in SORT_COLUMNS, 'mouse': lambda v: v in ('on', 'off')}
+         'sort': lambda v: v in SORT_COLUMNS, 'mouse': lambda v: v in ('on', 'off'),
+         'hidden': lambda v: all(name in EXTRA_METRICS for name in v.split(',') if name)}  # recorded, no graph tab
 
 
 def load_settings():
@@ -1219,6 +1229,7 @@ class Viewer:
         self.glyphs = GLYPHS if unicode else ASCII_GLYPHS
         self.styles = self.make_styles(use_color and curses.has_colors())
         self.columns, self.graph_values = {}, {}  # caches, by column start and the settings that shape them
+        self.hidden = {name for name in settings['hidden'].split(',') if name}  # opt-in metrics set to record only
         self.metrics = self.graph_tabs()
         self.statistic = settings['statistic']
         self.metric = settings['graph'] if settings['graph'] in self.metrics else 'Memory'
@@ -1235,11 +1246,14 @@ class Viewer:
         self.cursor = self.view_end = self.align(self.store.times[-1])
 
     def graph_tabs(self):
-        """Memory, CPU, Load and Swap, then each opt-in metric the service records or the data has readings of."""
-        recorded = recording()[2]
-        return METRICS + [tab for name, tab in EXTRA_METRICS.items()
-                          if name in recorded or any(metric_value(sample, tab) is not None
-                                                     for sample in self.store.host.values())]
+        """Memory, CPU, Load and Swap, then each opt-in metric that's on: recorded by the service here and not set to
+        record only. A dump, or a machine without the service, shows the ones its data has readings of."""
+        interval, _, recorded = recording()
+        wanted = set(recorded)
+        if self.sampler is None or interval is None:
+            wanted |= {name for name, tab in EXTRA_METRICS.items()
+                       if any(metric_value(sample, tab) is not None for sample in self.store.host.values())}
+        return METRICS + [tab for name, tab in EXTRA_METRICS.items() if name in wanted and name not in self.hidden]
 
     @staticmethod
     def make_styles(use_color):
@@ -1273,7 +1287,7 @@ class Viewer:
     def settings(self):
         return {'tz': self.tz, 'statistic': self.statistic, 'granularity': str(self.zoom), 'graph': self.metric,
                 'delay': str(self.delay), 'view': 'tree' if self.tree else 'list', 'sort': self.sort_key,
-                'mouse': 'on' if self.mouse_on else 'off'}
+                'mouse': 'on' if self.mouse_on else 'off', 'hidden': ','.join(sorted(self.hidden))}
 
     def apply_mouse(self):
         """Mouse on: clicks go to hmon and a drag selects text through hmon; holding Shift (Option in iTerm2) lets the
@@ -1563,11 +1577,11 @@ class Viewer:
         """Why an opt-in graph has nothing in view, and what would change that, if anything can."""
         name = next(name for name, tab in EXTRA_METRICS.items() if tab == metric)
         what = {'temperature': 'temperature', 'cpu-power': 'CPU power', 'battery': 'battery'}[name]
+        if self.sampler is None:  # a dump, or another machine's data: this machine's sensors say nothing about it
+            return f'No {what} readings in this window'
         interval, _, recorded = recording()
         if interval is not None and name not in recorded:
             return f'No {what} readings: turn them on in F2 Setup, under Recording'
-        if self.sampler is None:  # a dump, or another machine's data: this machine's sensors say nothing about it
-            return f'No {what} readings in this window'
         machine = virtual_machine()
         if machine:
             return f'No {what} readings: this is a virtual machine ({machine}), which has no such sensors'
@@ -1813,7 +1827,8 @@ class Viewer:
             return [], None, str, str
         if name in self.OPT_INS:
             metric, meaning = self.OPT_INS[name]
-            return ['on', 'off'], 'on' if metric in metrics else 'off', str, lambda v: f'{v}   {meaning}'
+            current = 'off' if metric not in metrics else 'record only' if metric in self.hidden else 'on'
+            return OPT_IN_STATES, current, str, lambda v: f'{v:<13}{opt_in_text(v, meaning)}'
         if name == 'Sample every':
             return (INTERVALS, interval, lambda s: f'{s} s',
                     lambda s: f'{s} s'.ljust(8) + f'about {disk(s):,.0f} MB a day')
@@ -1825,7 +1840,7 @@ class Viewer:
         if (name in ('Sample every', 'Keep') or name in self.OPT_INS) and current is None:
             return 'the hmon service is not installed here'
         if name in self.OPT_INS:
-            return f'{current}   ' + (f'records {self.OPT_INS[name][1]}' if current == 'on' else 'not recorded')
+            return f'{current:<13}{opt_in_text(current, self.OPT_INS[name][1])}'
         if name == 'Time zone':
             return f'{self.tz}   ({zone_label(self.tz)})'
         if name == 'Mouse':
@@ -1857,9 +1872,11 @@ class Viewer:
             self.recording[0] = value
         elif name == 'Keep':
             self.recording[1] = value
-        else:  # an opt-in metric: a new list, so Setup can tell it from the installed one
+        else:  # an opt-in metric: what's recorded (a new list, so Setup can tell it from the installed one), and its tab
             metric = self.OPT_INS[name][0]
-            self.recording[2] = sorted(set(self.recording[2]) | {metric} if value == 'on' else set(self.recording[2]) - {metric})
+            recorded = set(self.recording[2])
+            self.recording[2] = sorted(recorded - {metric} if value == 'off' else recorded | {metric})
+            self.hidden = self.hidden | {metric} if value == 'record only' else self.hidden - {metric}
 
     def choose(self, y, x, title, options, current, describe=str, backdrop=None):
         """A dropdown at (y, x) over what `backdrop()` draws: arrows, PgUp/PgDn, Home/End or the wheel move, typing
@@ -1985,7 +2002,9 @@ class Viewer:
             else:
                 notices.append(self.configure_as_root(['configure', '--interval', str(interval), '--retention', str(days),
                                                        '--metrics', ','.join(metrics) or 'none']))
-            self.metrics = self.graph_tabs()  # a metric just turned on gets its tab
+        self.metrics = self.graph_tabs()  # a metric just turned on gets its tab; one set to record only loses it
+        if self.metric not in self.metrics:
+            self.metric = 'Memory'
         try:
             save_settings(self.settings())
             notices.append(f'Settings saved to {CONFIG_PATH}.')
