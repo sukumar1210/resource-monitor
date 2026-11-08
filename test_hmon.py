@@ -134,11 +134,13 @@ class EndToEnd(unittest.TestCase):
             os.environ['TZ'] = ORIGINAL_TZ
         time.tzset()
 
-    def collect_samples(self, samples, files, which=None):
-        """Runs the real collector for `samples` samples over fake /proc `files`; returns its data dir and sleeps."""
+    def collect_samples(self, samples, files, which=None, proc=None, reading_seconds=3600):
+        """Runs the real collector until its `samples`th sleep over fake /proc `files`; returns its data dir and sleeps.
+        The default reading_seconds leaves no readings between rows, and one sleep per row."""
         data_dir = os.path.join(self.dir.name, 'collected')
-        proc = {'/proc/stat': 'cpu 100 0 50 800 50 0 0 0 0 0\n', '/proc/loadavg': '0.50 0.40 0.30 1/200 999\n',
-                '/proc/meminfo': 'MemTotal: 8000000 kB\nMemAvailable: 3000000 kB\nSwapTotal: 0 kB\nSwapFree: 0 kB\n'}
+        proc = proc or {
+            '/proc/stat': 'cpu 100 0 50 800 50 0 0 0 0 0\n', '/proc/loadavg': '0.50 0.40 0.30 1/200 999\n',
+            '/proc/meminfo': 'MemTotal: 8000000 kB\nMemAvailable: 3000000 kB\nSwapTotal: 0 kB\nSwapFree: 0 kB\n'}
         real_open, slept = open, []
 
         def sleep(seconds):
@@ -150,13 +152,124 @@ class EndToEnd(unittest.TestCase):
                 mock.patch.object(hmon.os, 'listdir', return_value=sorted({path.split('/')[2] for path in files})), \
                 mock.patch.object(hmon, 'read_text', side_effect=lambda path: files.get(path, '')), \
                 mock.patch.object(hmon, 'open', create=True,
-                                  side_effect=lambda path, *a, **k: io.StringIO(proc[path]) if path in proc
-                                  else real_open(path, *a, **k)), \
+                                  side_effect=lambda path, *a, **k: io.StringIO(
+                                      proc[path] if isinstance(proc[path], str) else next(proc[path]))
+                                  if path in proc else real_open(path, *a, **k)), \
                 mock.patch.object(hmon.shutil, 'which', return_value=which), \
+                mock.patch.object(hmon, 'READING_SECONDS', reading_seconds), \
                 mock.patch.object(hmon.time, 'monotonic', side_effect=itertools.count(0, 30)), \
                 mock.patch.object(hmon.time, 'sleep', side_effect=sleep), self.assertRaises(Stop):
             hmon.main(['collect'])
         return data_dir, slept
+
+    def test_a_recorded_row_sums_up_the_readings_since_the_last_one(self):
+        files = proc_files(900, 1, 'prog', '/system.slice/prog.service', 10 * MiB, 0)
+        busy, idle, stats = 100, 900, ['cpu 100 0 0 900 0 0 0 0 0 0\n']
+        for percent in (10, 90, 20, 20, 30, 10):  # the second row's six readings
+            busy, idle = busy + percent, idle + 100 - percent
+            stats.append(f'cpu {busy} 0 0 {idle} 0 0 0 0 0 0\n')
+        used, swapped = [1, 2, 2, 6, 2, 2, 4], [0, 1, 1, 1, 1, 1, 4]  # millions of kB; hundreds of thousands of kB
+        meminfo = [f'MemTotal: 8000000 kB\nMemAvailable: {8 - u}000000 kB\n'
+                   f'SwapTotal: 900000 kB\nSwapFree: {9 - s}00000 kB\n' for u, s in zip(used, swapped)]
+        proc = {'/proc/stat': iter(stats), '/proc/meminfo': iter(meminfo),
+                '/proc/loadavg': '0.50 0.40 0.30 1/200 999\n'}
+        data_dir, slept = self.collect_samples(7, files, proc=proc, reading_seconds=5)
+        self.assertEqual(slept, [5] * 7)  # five sleeps with a reading after each, the final one, then the next row's
+        with open(glob.glob(os.path.join(data_dir, 'host_*.csv'))[0], newline='') as f:
+            first, second = list(csv.DictReader(f))
+        self.assertEqual((first['readings'], first['cpu_min']), ('1', ''))  # nothing earlier to sum up
+        self.assertEqual(second['readings'], '6')
+        self.assertEqual((second['cpu_percent'], second['cpu_min'], second['cpu_max']), ('30.0', '10.0', '90.0'))
+        self.assertEqual((second['mem_used_avg_bytes'], second['mem_used_min_bytes'], second['mem_used_max_bytes']),
+                         tuple(str(kb * 1024) for kb in (3000000, 2000000, 6000000)))
+        self.assertEqual((second['swap_used_avg_bytes'], second['swap_used_min_bytes'], second['swap_used_max_bytes']),
+                         tuple(str(kb * 1024) for kb in (150000, 100000, 400000)))
+        self.assertEqual(int(second['mem_total_bytes']) - int(second['mem_available_bytes']), 4000000 * 1024)
+
+    def test_zooming_weighs_rows_by_the_readings_they_sum_up(self):
+        data_dir = os.path.join(self.dir.name, 'rollups')
+        with mock.patch.object(hmon, 'DATA_DIR', data_dir):
+            os.makedirs(data_dir)
+            for ts, cpu, rollup in (('2026-11-06T04:01:10Z', 10.0, [12, 5.0, 20.0]),
+                                    ('2026-11-06T04:02:10Z', 60.0, [3, 50.0, 90.0]),
+                                    ('2026-11-06T04:03:10Z', 30.0, None)):  # an older row, with no readings
+                row = [ts, cpu, 1.0, 8 * GiB, 4 * GiB, 0, 1, 1, 0]
+                if rollup:
+                    row += ['', '', ''] + rollup + [4 * GiB] * 3 + [0] * 3
+                hmon.append('host', hmon.HOST_FIELDS, [row], '2026-11-06')
+                hmon.append('processes', hmon.PROCESS_FIELDS, [
+                    [ts, 500, '', 'prog', 100 * MiB, 5.0, 'prog --serve', 1, '/system.slice/prog.service']],
+                    '2026-11-06')
+        c = hmon.curses
+        with mock.patch.dict(hmon.DEFAULTS, tooltip_stats='Average,Maximum,Minimum,p50,p99'):
+            five = browse(data_dir, [ord('\t'), ord('['), ord('i')])[3]  # the CPU tab, 5 min bars, the newest pinned
+            one = browse(data_dir, [ord('\t'), c.KEY_LEFT, ord('i')])[3]  # 1 min bars, the second row's
+            maximum = browse(data_dir, [ord('\t'), ord('['), ord('s')])[3]  # Average, then Maximum
+        self.assertIn('· 16 samples', five)
+        for statistic, shown in (('Average', '20.6%'), ('Maximum', '90.0%'), ('Minimum', '5.0%'), ('p50', '10.0%'),
+                                 ('p99', '90.0%')):  # unweighted, the average would be 33.3%
+            self.assertRegex(five, statistic + r'\s+' + shown)
+        self.assertIn('· 3 samples', one)  # the reported case: one row on a bar, and its statistics differ
+        for statistic, shown in (('Average', '60.0%'), ('Maximum', '90.0%'), ('Minimum', '50.0%')):
+            self.assertRegex(one, statistic + r'\s+' + shown)
+        self.assertIn('90.0%', next(line for line in maximum.split('\n') if 'CPU[' in line))
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            hmon.main(['sql', 'SELECT readings, cpu_max, mem_used_avg FROM host WHERE readings = 3', data_dir,
+                      '--from', '6/11/2026 04:00 UTC', '--to', '6/11/2026 05:00 UTC'])
+        self.assertRegex(out.getvalue(), r'3\s+90\s+4294967296')
+
+    def test_live_readings_give_way_to_the_row_that_covers_them(self):
+        data_dir = os.path.join(self.dir.name, 'covering')
+        with mock.patch.object(hmon, 'DATA_DIR', data_dir):
+            os.makedirs(data_dir)
+            for ts, day in (('2026-11-05T23:59:10Z', '2026-11-05'), ('2026-11-06T04:00:10Z', '2026-11-06')):
+                rollup = [12, 5.0, 20.0] + [4 * GiB] * 3 + [0] * 3
+                hmon.append('host', hmon.HOST_FIELDS,
+                            [[ts, 10.0, 1.0, 8 * GiB, 4 * GiB, 0, 1, 1, 0, '', '', ''] + rollup], day)
+                hmon.append('processes', hmon.PROCESS_FIELDS, [
+                    [ts, 500, '', 'prog', 100 * MiB, 5.0, 'prog --serve', 1, '/system.slice/prog.service']], day)
+        today = os.path.join(data_dir, 'host_2026-11-06.csv')
+        row = '2026-11-06T04:00:45Z,40.0,1.0,8589934592,4294967296,0,1,1,0,,,,12,30.0,60.0,4294967296,4294967296,' \
+              '4294967296,0,0,0\n'
+
+        class Collecting:
+            """Stands in for the collector too: a live reading every 10 s, and what the collector writes meanwhile."""
+            metrics = []
+
+            def __init__(self):
+                self.t = hmon.to_second('2026-11-06T04:00:10Z')
+
+            def pause(self):
+                pass
+
+            def sample(self):
+                self.t += 10
+                ts = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(self.t))
+                if ts.endswith(':30Z'):  # half a row lands, which must wait for the rest of it
+                    with open(today, 'a') as f:
+                        f.write(row[:40])
+                elif ts.endswith(':40Z'):  # an old day's file expires
+                    os.remove(os.path.join(data_dir, 'host_2026-11-05.csv'))
+                elif ts.endswith(':50Z'):  # the rest of it: the row covering :20 to :40 has landed, as whole rows do
+                    with open(today, 'a') as f:
+                        f.write(row[40:])
+                return self.t, [ts, 50.0 if ts.endswith(':50Z') else 99.0, 1.0, 8 * GiB, 4 * GiB, 0, 1, 1, 0], []
+
+        samples = mock.Mock(wraps=hmon.host_sample)
+        with mock.patch.object(hmon, 'RELOAD_SECONDS', 0), mock.patch.object(hmon, 'host_sample', samples):
+            screen = FakeScreen([ord('\t'), ord('i'), -1, -1, -1])  # the CPU tab; pin the newest bar's tooltip; 3 ticks
+            store = hmon.Store(data_dir)
+            hmon.Viewer(screen, store, dict(hmon.DEFAULTS, tz='UTC'), Collecting(), use_color=False).run()
+        frames = screen.frames[2:6]  # pinned, then after each of the live readings at :30, :40 and :50
+        # the row's 12 and the live ones, half a row being waited for; then the covering row's own highest, 60, as the
+        # live 99s it covers stop counting
+        for frame, count, highest in zip(frames, (13, 14, 15, 25), ('99.0', '99.0', '99.0', '60.0')):
+            self.assertIn(f'04:00 · {count} samples', frame)
+            self.assertRegex(frame, r'Maximum\s+' + highest.replace('.', r'\.') + '%')
+        self.assertEqual(sorted(store.live_host), [hmon.to_second('2026-11-06T04:00:50Z')])  # :20 to :40 gave way
+        self.assertNotIn(hmon.to_second('2026-11-05T23:59:10Z'), store.times)  # the expired day's file is gone
+        # 2 rows read at the start, 4 live readings, the day's row read again once for the expiry, and the new row once
+        self.assertEqual(samples.call_count, 8)
 
     def test_a_huge_command_line_stays_cheap_and_masked(self):
         command = 'prog --password hunter2 ' + '-' * 64000
@@ -584,6 +697,7 @@ class EndToEnd(unittest.TestCase):
                 mock.patch.dict(os.environ, {'HMON_METRICS': 'temperature,cpu-power,battery'}), \
                 mock.patch.object(hmon.os, 'listdir', return_value=[]), \
                 mock.patch.object(hmon.shutil, 'which', return_value=None), \
+                mock.patch.object(hmon, 'READING_SECONDS', 3600), \
                 mock.patch.object(hmon, 'open', create=True,
                                   side_effect=lambda path, *a, **k: io.StringIO(proc[path]) if path in proc
                                   else real_open(path, *a, **k)), \
@@ -592,8 +706,8 @@ class EndToEnd(unittest.TestCase):
             hmon.main(['collect'])
         with open(glob.glob(os.path.join(data_dir, 'host_*.csv'))[0]) as f:
             rows = list(csv.reader(f))
-        self.assertEqual(rows[0][-3:], ['temps_c', 'cpu_power_w', 'battery_power_w'])
-        self.assertEqual(rows[2][-3:], ['45;52', '1.0', '12.5'])  # every sensor; 120 J in 120 s; 12.5 W out
+        self.assertEqual(rows[0][9:12], ['temps_c', 'cpu_power_w', 'battery_power_w'])
+        self.assertEqual(rows[2][9:12], ['45;52', '1.0', '12.5'])  # every sensor; 120 J in 120 s; 12.5 W out
 
         with mock.patch.object(hmon, 'UNIT_PATH', os.path.join(self.dir.name, 'none.service')):
             frames = browse(data_dir, [ord('\t')] * 4 + [ord('s'), ord('s'), ord('\t'), ord('\t')])

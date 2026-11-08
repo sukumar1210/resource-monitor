@@ -1,3 +1,13 @@
+What's new in version 0.2.17
+
+* Each recorded row now sums up CPU, memory and swap readings taken every 5 s, so Average, Maximum and Minimum differ
+  even on a bar holding one row, and stay right at every zoom, weighed by how many readings each row holds; p50, p90
+  and p99 are approximate. Rows recorded before this release stay as they were
+* Past bars show recorded rows only, whether or not hmon was open; live readings count until the row covering them lands
+* The viewer reads only what's new in the host files, not all of them every 30 seconds
+* The collector runs at normal CPU and disk priority again: at low priority an overloaded host could delay samples
+  just before a crash
+
 What's new in version 0.2.16
 
 * A process with huge arguments can no longer pin hmon on a CPU core: only the start of a command line is masked

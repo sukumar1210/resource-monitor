@@ -58,11 +58,14 @@ SECRETS = [
 ]
 MASKED_CHARS = 1024  # how much of a command line is masked and kept from; the patterns slow down sharply with length
 DOCKER_MAX_WAIT = 10  # most samples to skip while docker stats keeps failing, as when the daemon is stopped
+READING_SECONDS = 5  # how often the collector reads CPU, memory and swap, which each recorded row sums up
 
 # Columns are only ever added at the end, and readers take the columns they know by position, so files written
 # before and after an update stay readable.
 HOST_FIELDS = ['ts', 'cpu_percent', 'load_1m', 'mem_total_bytes', 'mem_available_bytes', 'swap_used_bytes',
-               'load_5m', 'load_15m', 'swap_total_bytes', 'temps_c', 'cpu_power_w', 'battery_power_w']
+               'load_5m', 'load_15m', 'swap_total_bytes', 'temps_c', 'cpu_power_w', 'battery_power_w',
+               'readings', 'cpu_min', 'cpu_max', 'mem_used_avg_bytes', 'mem_used_min_bytes', 'mem_used_max_bytes',
+               'swap_used_avg_bytes', 'swap_used_min_bytes', 'swap_used_max_bytes']
 CONTAINER_FIELDS = ['ts', 'container', 'cpu_percent', 'mem_bytes', 'mem_limit_bytes', 'net_rx_bytes',
                     'net_tx_bytes', 'block_read_bytes', 'block_write_bytes', 'pids', 'id']
 PROCESS_FIELDS = ['ts', 'pid', 'container', 'name', 'rss_bytes', 'cpu_percent', 'cmdline', 'ppid', 'cgroup']
@@ -99,21 +102,23 @@ def cgroup_path(text):
     return ''
 
 
+def busy_percent(ticks, previous):
+    """CPU % between two (total, idle + iowait) readings of /proc/stat; None without an earlier one."""
+    if not previous or ticks[0] <= previous[0]:
+        return None
+    return round(100 * (1 - (ticks[1] - previous[1]) / (ticks[0] - previous[0])), 1)
+
+
 def sample_host(ts, prev_cpu_ticks):
     with open('/proc/stat') as f:
         ticks = [int(v) for v in f.readline().split()[1:9]]
     cpu_ticks = (sum(ticks), ticks[3] + ticks[4])  # (total, idle + iowait)
-    cpu_percent = None
-    if prev_cpu_ticks and cpu_ticks[0] > prev_cpu_ticks[0]:
-        total = cpu_ticks[0] - prev_cpu_ticks[0]
-        idle = cpu_ticks[1] - prev_cpu_ticks[1]
-        cpu_percent = round(100 * (1 - idle / total), 1)
     with open('/proc/meminfo') as f:
         mem = {line.split(':')[0]: int(line.split()[1]) * 1024 for line in f}
     with open('/proc/loadavg') as f:
         load_1m, load_5m, load_15m = (float(v) for v in f.read().split()[:3])
-    row = [ts, cpu_percent, load_1m, mem['MemTotal'], mem['MemAvailable'], mem['SwapTotal'] - mem['SwapFree'],
-           load_5m, load_15m, mem['SwapTotal']]
+    row = [ts, busy_percent(cpu_ticks, prev_cpu_ticks), load_1m, mem['MemTotal'], mem['MemAvailable'],
+           mem['SwapTotal'] - mem['SwapFree'], load_5m, load_15m, mem['SwapTotal']]
     return row, cpu_ticks
 
 
@@ -275,11 +280,21 @@ def append(kind, fields, rows, day):
         os.fsync(f.fileno())
 
 
+def rollup_columns(readings):
+    """The columns of a recorded row that sum up the host readings since the last one: how many; CPU's lowest and
+    highest, its average being the row's own, over the whole gap; memory's and swap's average, lowest and highest."""
+    cpu = [row[1] for row in readings if row[1] is not None]
+    used, swap = [row[3] - row[4] for row in readings], [row[5] for row in readings]
+    return [len(readings), min(cpu, default=''), max(cpu, default=''),
+            round(sum(used) / len(used)), min(used), max(used), round(sum(swap) / len(swap)), min(swap), max(swap)]
+
+
 def collect():
     os.umask(0o022)  # readable by everyone, like /proc; the installer makes the directory root-only where /proc is
     os.makedirs(DATA_DIR, exist_ok=True)
     has_docker = shutil.which('docker') is not None
-    prev_cpu_ticks, prev_procs, container_names, prev_energy = None, None, {}, None
+    row_ticks, read_ticks, readings = None, None, []  # /proc/stat at the last row and the last reading; readings since
+    prev_procs, container_names, prev_energy = None, {}, None
     metrics = [name for name in os.environ.get('HMON_METRICS', '').split(',') if name in EXTRA_METRICS]
     docker_wait, docker_failures = 0, 0
     while True:
@@ -287,11 +302,12 @@ def collect():
         now = datetime.now(timezone.utc)
         ts, day = now.strftime('%Y-%m-%dT%H:%M:%SZ'), now.strftime('%Y-%m-%d')
         try:
-            row, prev_cpu_ticks = sample_host(ts, prev_cpu_ticks)
-            if metrics:
-                extras, prev_energy = sample_extras(metrics, prev_energy)
-                row += extras
-            append('host', HOST_FIELDS, [row], day)
+            row, read_ticks = sample_host(ts, read_ticks)
+            readings.append(row)
+            rollup, readings = rollup_columns(readings), []  # emptied before the write, so a full disk can't grow them
+            row[1], row_ticks = busy_percent(read_ticks, row_ticks), read_ticks  # the row's CPU is over the whole gap
+            extras, prev_energy = sample_extras(metrics, prev_energy)  # None for each one not opted in
+            append('host', HOST_FIELDS, [row + extras + rollup], day)
         except Exception:
             logging.exception('host sample failed')
         if has_docker and docker_wait:
@@ -312,7 +328,16 @@ def collect():
         except Exception:
             logging.exception('process sample failed')
         # a slow sample still leaves a gap, so a stalled docker or a tiny interval can't keep the loop running flat out
-        time.sleep(max(1, INTERVAL_SECONDS / 2, INTERVAL_SECONDS - (time.monotonic() - started)))
+        left = max(1, INTERVAL_SECONDS / 2, INTERVAL_SECONDS - (time.monotonic() - started))
+        while left > READING_SECONDS:
+            time.sleep(READING_SECONDS)
+            left -= READING_SECONDS
+            try:
+                reading, read_ticks = sample_host('', read_ticks)
+                readings.append(reading)
+            except Exception:
+                pass  # a lasting failure shows up in the next row's own reading
+        time.sleep(left)
 
 
 # ---------------------------------------------------------------- times and zones
@@ -494,11 +519,12 @@ def show_snapshot(at, csv_dir=DATA_DIR):
 
 
 HostSample = namedtuple('HostSample', 'cpu load_1m load_5m load_15m mem_used mem_total swap_used swap_total temps '
-                                       'cpu_power battery_power')  # temps: a tuple, every sensor's °C
+                                       'cpu_power battery_power')
+# temps: every sensor's °C; cpu, mem_used, swap_used: a Rollup in rows that sum up readings
+Rollup = namedtuple('Rollup', 'count average low high')  # what a recorded row keeps of the readings it sums up
 ProcRow = namedtuple('ProcRow', 'pid ppid container name command cgroup mem cpu')
 # Like htop, the viewer holds what's on screen rather than the history behind it.
-LIVE_HOST_SECONDS = 900  # the viewer's own live host samples kept for the graph
-LIVE_PROCESS_SECONDS = 60  # and its live process samples, which are much bigger
+LIVE_PROCESS_SECONDS = 60  # the viewer's own live process samples kept, which are much bigger than host ones
 SAMPLE_LIMIT = 240  # samples a column reads for the table at most, evenly spread; the graph stays exact
 COLUMN_CACHE = 64  # columns kept computed
 WHEEL_DOWN = 1 << 40  # hmon's own button state for the wheel turned down, where ncurses has no button 5
@@ -507,13 +533,20 @@ NOW_ZOOM = 60  # live bars this short show what runs now; longer ones keep their
 RELOAD_SECONDS = 30
 
 
+def rolled_up(readings, average, low, high, plain):
+    """A measure of a host row: the Rollup of the readings it sums up, or `plain` in rows without them."""
+    return Rollup(int(readings), number(average), number(low), number(high)) if readings and low != '' else plain
+
+
 def host_sample(row):
-    """A host CSV row (strings, or the collector's values) -> HostSample; columns newer than the file are None."""
-    ts, cpu, load_1m, total, available, swap_used, load_5m, load_15m, swap_total, temps, cpu_w, battery_w = \
-        (list(row) + [''] * 12)[:12]
-    return HostSample(number(cpu), number(load_1m), number(load_5m), number(load_15m),
-                      int(total) - int(available), int(total), number(swap_used), number(swap_total),
-                      sensors(temps), number(cpu_w), number(battery_w))
+    """A host CSV row (strings, or the collector's values) -> HostSample; columns newer than the file are None, and
+    rows with no readings columns, older or live, hold plain numbers."""
+    ts, cpu, load_1m, total, available, swap_used, load_5m, load_15m, swap_total, temps, cpu_w, battery_w, readings, \
+        cpu_min, cpu_max, mem_avg, mem_min, mem_max, swap_avg, swap_min, swap_max = (list(row) + [''] * 21)[:21]
+    return HostSample(rolled_up(readings, cpu, cpu_min, cpu_max, number(cpu)), number(load_1m), number(load_5m),
+                      number(load_15m), rolled_up(readings, mem_avg, mem_min, mem_max, int(total) - int(available)),
+                      int(total), rolled_up(readings, swap_avg, swap_min, swap_max, number(swap_used)),
+                      number(swap_total), sensors(temps), number(cpu_w), number(battery_w))
 
 
 def sensors(text):
@@ -521,14 +554,16 @@ def sensors(text):
     return tuple(float(value) for value in (text or '').split(';') if value) or None
 
 
-def load_host(csv_dir):
-    """{time: HostSample} for every host sample on disk."""
-    host = {}
-    for path in sorted(glob.glob(os.path.join(csv_dir, 'host_*.csv'))):
-        with open(path, newline='') as f:
-            for row in islice(csv.reader(f), 1, None):
-                host[to_second(row[0])] = host_sample(row)
-    return host
+def read_host(path, position, host):
+    """Adds to `host` the samples a host CSV has past `position`, short of a row still being written; returns how far
+    it read."""
+    with open(path, 'rb') as f:
+        f.seek(position)
+        new = f.read()
+    new = new[:new.rfind(b'\n') + 1]
+    for row in islice(csv.reader(new.decode(errors='replace').splitlines()), 0 if position else 1, None):
+        host[to_second(row[0])] = host_sample(row)
+    return position + len(new)
 
 
 class DayFile:
@@ -569,22 +604,35 @@ class DayFile:
 
 
 class Store:
-    """The recorded samples plus the viewer's own recent live samples, by time range."""
+    """The recorded samples, plus the viewer's own live ones newer than the last recorded row, which sums up those
+    before it; so past bars read the same whether or not a viewer was open."""
 
     def __init__(self, csv_dir):
         self.csv_dir = csv_dir
         self.files = {}
+        self.host, self.read_to = {}, {}  # time -> HostSample; host CSV -> how far it's been read
         self.live_host, self.live_rows = {}, {}  # time -> HostSample / process rows shaped like the CSV's
+        # a sample period, and the wait until the viewer reads its row; only a stopped collector ever reaches this
+        self.live_seconds = (recording()[0] or 60) + RELOAD_SECONDS
         self.reload()
 
     def reload(self):
-        self.host = load_host(self.csv_dir)
+        """Reads what the collector added since the last time; all of it again only when a day's file has expired."""
+        paths = sorted(glob.glob(os.path.join(self.csv_dir, 'host_*.csv')))
+        if set(self.read_to) - set(paths):
+            self.host, self.read_to = {}, {}
+        for path in paths:
+            self.read_to[path] = read_host(path, self.read_to.get(path, 0), self.host)
+        newest = max(self.host, default=0)
+        for live in (self.live_host, self.live_rows):
+            for t in [t for t in live if t < newest]:
+                del live[t]
         self.times = sorted(set(self.host) | set(self.live_host))
 
     def add_live(self, t, host_row, process_rows):
         self.live_host[t] = host_sample(host_row)
         self.live_rows[t] = [['' if value is None else str(value) for value in row] for row in process_rows]
-        for old in [s for s in self.live_host if s < t - LIVE_HOST_SECONDS]:
+        for old in [s for s in self.live_host if s < t - self.live_seconds]:
             del self.live_host[old]
             if old not in self.host:
                 del self.times[bisect_left(self.times, old)]
@@ -672,15 +720,18 @@ class Stat:
         self.statistic, self.count, self.total, self.high, self.low = statistic, 0, 0.0, None, None
         self.values = array('d') if statistic.startswith('p') else None
 
-    def add(self, value):
+    def add(self, value, count=1, low=None, high=None):
+        """One reading, or `count` of them summed up in their average, lowest and highest. Percentiles of those are
+        approximate: they count the two ends, and the rest at the average."""
         if value is None:
             return
-        self.count += 1
-        self.total += value
-        self.high = value if self.high is None else max(self.high, value)
-        self.low = value if self.low is None else min(self.low, value)
+        low, high = value if low is None else low, value if high is None else high
+        self.count += count
+        self.total += value * count
+        self.high = high if self.high is None else max(self.high, high)
+        self.low = low if self.low is None else min(self.low, low)
         if self.values is not None:
-            self.values.append(value)
+            self.values.extend([value] if count < 2 else [low, high] + [value] * (count - 2))
 
     def result(self):
         if not self.count:
@@ -696,24 +747,36 @@ class Stat:
 
 
 def aggregate(values, statistic):
-    """The statistic over `values`; a tuple among them (several sensors at once) counts each of its readings."""
+    """The statistic over `values`; a Rollup among them counts every reading it sums up, and a tuple (several sensors
+    at once) each of its readings."""
     stat = Stat(statistic)
     for value in values:
-        for one in value if isinstance(value, tuple) else (value,):
-            stat.add(one)
+        if isinstance(value, Rollup):
+            stat.add(value.average, value.count, value.low, value.high)
+        else:
+            for one in value if isinstance(value, tuple) else (value,):
+                stat.add(one)
     return stat.result()
+
+
+def scaled(value, factor):
+    if isinstance(value, Rollup):
+        return Rollup(value.count, value.average * factor, value.low * factor, value.high * factor)
+    return value * factor
 
 
 def metric_value(sample, metric):
     if metric == 'Memory':
-        return 100 * sample.mem_used / sample.mem_total
+        return scaled(sample.mem_used, 100 / sample.mem_total)
     if metric == 'CPU':
         return sample.cpu
     if metric == 'Load':
         return sample.load_1m
     if metric in ('Temp', 'CPU W', 'Batt W'):
         return {'Temp': sample.temps, 'CPU W': sample.cpu_power, 'Batt W': sample.battery_power}[metric]
-    return 100 * sample.swap_used / sample.swap_total if sample.swap_used is not None and sample.swap_total else None
+    if sample.swap_used is None or not sample.swap_total:
+        return None
+    return scaled(sample.swap_used, 100 / sample.swap_total)
 
 
 Column = namedtuple('Column', 'host procs apps groups pids step')
@@ -2468,7 +2531,8 @@ class Viewer:
             width = max(len(statistic) for statistic in self.tip_stats)
             rows = [(f' {statistic:<{width}}  {metric_text(self.metric, aggregate(values, statistic))}', 'normal')
                     for statistic in self.tip_stats]
-            title = f' {when} · {len(samples)} sample{"" if len(samples) == 1 else "s"} '  # one sample: all alike
+            count = sum(value.count if isinstance(value, Rollup) else 1 for value in values)
+            title = f' {when} · {count} sample{"" if count == 1 else "s"} '  # one sample: all alike
         width = max([len(title) + 2] + [len(text) + 1 for text, _ in rows])
         lines = ([(left + title + line * (width - len(title)) + right, 'header')]
                  + [(side + text.ljust(width) + side, style) for text, style in rows]
@@ -2710,7 +2774,9 @@ def write_dump(csv_dir, start, end, output):
 SCHEMA = '''
 CREATE TABLE host (ts TEXT, time INTEGER, cpu_percent REAL, load_1m REAL, load_5m REAL, load_15m REAL,
                    mem_total INTEGER, mem_available INTEGER, mem_used INTEGER, swap_used INTEGER, swap_total INTEGER,
-                   temp_avg_c REAL, temp_max_c REAL, temp_min_c REAL, cpu_power_w REAL, battery_power_w REAL);
+                   temp_avg_c REAL, temp_max_c REAL, temp_min_c REAL, cpu_power_w REAL, battery_power_w REAL,
+                   readings INTEGER, cpu_min REAL, cpu_max REAL, mem_used_avg INTEGER, mem_used_min INTEGER,
+                   mem_used_max INTEGER, swap_used_avg INTEGER, swap_used_min INTEGER, swap_used_max INTEGER);
 CREATE TABLE containers (ts TEXT, time INTEGER, container TEXT, cpu_percent REAL, mem INTEGER, mem_limit INTEGER,
                          net_rx INTEGER, net_tx INTEGER, block_read INTEGER, block_write INTEGER, pids INTEGER);
 CREATE TABLE processes (ts TEXT, time INTEGER, pid INTEGER, ppid INTEGER, app TEXT, container TEXT, name TEXT,
@@ -2726,18 +2792,20 @@ def to_sqlite(csv_dir, start, end, path):
     import sqlite3
 
     def host_values(row):
+        padded = (row + [''] * 21)[:21]
         ts, cpu, load_1m, total, available, swap_used, load_5m, load_15m, swap_total, temps, cpu_w, battery_w = \
-            (row + [''] * 12)[:12]
+            padded[:12]
         degrees = sensors(temps) or ()
         return (ts, to_second(ts), number(cpu), number(load_1m), number(load_5m), number(load_15m), int(total),
                 int(available), int(total) - int(available), number(swap_used), number(swap_total),
                 round(sum(degrees) / len(degrees), 2) if degrees else None, max(degrees, default=None),
-                min(degrees, default=None), number(cpu_w), number(battery_w))
+                min(degrees, default=None), number(cpu_w), number(battery_w)) \
+            + tuple(number(value) for value in padded[12:])
 
     connection = sqlite3.connect(path)
     connection.executescript(SCHEMA)
     for _, csv_path in files_in_range(csv_dir, 'host', start, end):
-        connection.executemany('INSERT INTO host VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+        connection.executemany('INSERT INTO host VALUES (' + ','.join('?' * 25) + ')',
                                (host_values(row) for row in rows_in_range(csv_path, start, end)))
     for _, csv_path in files_in_range(csv_dir, 'containers', start, end):
         connection.executemany('INSERT INTO containers VALUES (?,?,?,?,?,?,?,?,?,?,?)',

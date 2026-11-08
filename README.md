@@ -36,7 +36,8 @@ F1 Help  F2 Setup  F3 Search  F4 Filter  F5 List  F6 SortBy  F10 Quit  ← / →
 
 ## What it records
 
-- **Host**: CPU %, load average, memory and swap.
+- **Host**: CPU %, load average, memory and swap. CPU, memory and swap are read every 5 s, and each recorded row
+  sums up the readings since the last one: how many, their average, lowest and highest.
 - **Docker containers** (if Docker is installed): `docker stats` CPU, memory, limit, network, block I/O, pids.
 - **Every process** using memory or CPU, with its parent, container and systemd unit, memory (RSS), CPU % and
   command line.
@@ -79,7 +80,10 @@ leaves `/usr/local/bin` off its PATH on some systems, such as Amazon Linux).
 - **Meters** (CPU, Mem, Swp, tasks, load, time) and the **table** show the column under the marker.
 - **The graph** plots memory, CPU, load or swap over time, one column per 10 s, 1 min, 5 min, 15 min, 30 min,
   1 hour or 1 day, reduced with a CloudWatch-style statistic: Average, Maximum, Minimum, p50, p90 or p99.
-  Apps and containers are totalled per sample before the statistic, so a Maximum is a real peak.
+  Apps and containers are totalled per sample before the statistic, so a Maximum is a real peak. Zooming weighs rows
+  by how many readings each holds, so Average, Maximum and Minimum stay right at every zoom, down to the 5 s readings; p50, p90 and p99 are approximate,
+  from each row's ends and average. Past bars are recorded rows only; live readings count until the row covering
+  them lands.
 - **The table groups processes into apps**, folded until you open them: containers sit under `docker`, system
   services take their systemd unit's name, and anything else is named after the program at the top of its process
   tree (so every `claude` process is one app). Inside an app, processes nest under their parents as in htop's tree.
@@ -106,8 +110,9 @@ The mouse acts when the button is released: click a row, a fold marker, a column
 tab, a point on the graph, or a function-bar item; the wheel scrolls the table, or moves through time over the graph.
 Hover over a bar for its tooltip, by the pointer: the bar's statistics (Average, Maximum and Minimum, or those ticked
 under Tooltip stats in F2 Setup) with how many samples it holds, or, after `v` (or a click on a pinned tooltip's
-title), the 3 apps that used the most then on Memory and CPU. A bar holding one sample shows the same number for
-each statistic: zoom out, or sample more often. Click the bar (or press `i` for the marker's bar) to pin it: Up/Down
+title), the 3 apps that used the most then on Memory and CPU. A bar recorded before 0.2.17 holding one sample shows
+the same number for each statistic: zoom out. Processes are recorded once per sample, so at bars that short the
+table doesn't change with the statistic. Click the bar (or press `i` for the marker's bar) to pin it: Up/Down
 then select its apps, and the table follows, unfolding and selecting each one; Esc closes it.
 
 **Kill (F9 or `k`)**, as in htop: a signal for the selected process (SIGTERM first; SIGKILL, SIGHUP, SIGINT, SIGQUIT,
@@ -197,7 +202,7 @@ host is sent. Without network access the check gives up quietly. The collector s
 
 | File | Columns |
 | --- | --- |
-| `host_YYYY-MM-DD.csv` | ts, cpu_percent, load_1m, mem_total_bytes, mem_available_bytes, swap_used_bytes, load_5m, load_15m, swap_total_bytes |
+| `host_YYYY-MM-DD.csv` | ts, cpu_percent, load_1m, mem_total_bytes, mem_available_bytes, swap_used_bytes, load_5m, load_15m, swap_total_bytes, temps_c, cpu_power_w, battery_power_w, readings, cpu_min, cpu_max, mem_used_avg_bytes, mem_used_min_bytes, mem_used_max_bytes, swap_used_avg_bytes, swap_used_min_bytes, swap_used_max_bytes |
 | `containers_YYYY-MM-DD.csv` | ts, container, cpu_percent, mem_bytes, mem_limit_bytes, net_rx_bytes, net_tx_bytes, block_read_bytes, block_write_bytes, pids, id |
 | `processes_YYYY-MM-DD.csv` | ts, pid, container, name, rss_bytes, cpu_percent, cmdline, ppid, cgroup |
 
