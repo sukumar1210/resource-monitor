@@ -108,6 +108,9 @@ def fake_sys(root, energy):
 class Live:
     """Stands in for /proc, a little after the last recorded sample: one new process, probe."""
 
+    def pause(self):
+        pass
+
     def sample(self):
         ts = '2026-11-06T04:00:30Z'
         return hmon.to_second(ts), [ts, 30.0, 1.0, 8 * GiB, 4 * GiB, 0, 1, 1, 0], [
@@ -130,6 +133,73 @@ class EndToEnd(unittest.TestCase):
         else:
             os.environ['TZ'] = ORIGINAL_TZ
         time.tzset()
+
+    def collect_samples(self, samples, files, which=None):
+        """Runs the real collector for `samples` samples over fake /proc `files`; returns its data dir and sleeps."""
+        data_dir = os.path.join(self.dir.name, 'collected')
+        proc = {'/proc/stat': 'cpu 100 0 50 800 50 0 0 0 0 0\n', '/proc/loadavg': '0.50 0.40 0.30 1/200 999\n',
+                '/proc/meminfo': 'MemTotal: 8000000 kB\nMemAvailable: 3000000 kB\nSwapTotal: 0 kB\nSwapFree: 0 kB\n'}
+        real_open, slept = open, []
+
+        def sleep(seconds):
+            slept.append(seconds)
+            if len(slept) == samples:
+                raise Stop
+
+        with mock.patch.object(hmon, 'DATA_DIR', data_dir), \
+                mock.patch.object(hmon.os, 'listdir', return_value=sorted({path.split('/')[2] for path in files})), \
+                mock.patch.object(hmon, 'read_text', side_effect=lambda path: files.get(path, '')), \
+                mock.patch.object(hmon, 'open', create=True,
+                                  side_effect=lambda path, *a, **k: io.StringIO(proc[path]) if path in proc
+                                  else real_open(path, *a, **k)), \
+                mock.patch.object(hmon.shutil, 'which', return_value=which), \
+                mock.patch.object(hmon.time, 'monotonic', side_effect=itertools.count(0, 30)), \
+                mock.patch.object(hmon.time, 'sleep', side_effect=sleep), self.assertRaises(Stop):
+            hmon.main(['collect'])
+        return data_dir, slept
+
+    def test_a_huge_command_line_stays_cheap_and_masked(self):
+        command = 'prog --password hunter2 ' + '-' * 64000
+        started = time.perf_counter()
+        data_dir, _ = self.collect_samples(1, proc_files(900, 1, command, '/system.slice/prog.service', 10 * MiB, 0))
+        self.assertLess(time.perf_counter() - started, 2)  # the whole of it took about 50 s to mask
+        with open(glob.glob(os.path.join(data_dir, 'processes_*.csv'))[0]) as f:
+            self.assertEqual(list(csv.reader(f))[1][6], 'prog --password ***')
+
+    def test_a_stopped_docker_is_tried_less_and_less_and_samples_keep_a_gap(self):
+        files = proc_files(900, 1, 'prog', '/system.slice/prog.service', 10 * MiB, 0)
+        stopped = hmon.subprocess.CalledProcessError(1, 'docker')
+        with mock.patch.object(hmon.subprocess, 'run', side_effect=stopped) as run, \
+                mock.patch.object(hmon.logging, 'warning') as warned, \
+                mock.patch.object(hmon.logging, 'exception') as failed:
+            _, slept = self.collect_samples(6, files, which='/usr/bin/docker')
+        self.assertEqual(run.call_count, 3)  # samples 1, 2 and 4: the wait grows while it keeps failing
+        warned.assert_called_once()
+        failed.assert_not_called()  # no traceback per sample
+        self.assertEqual(slept[0], hmon.INTERVAL_SECONDS / 2)  # each sample here overran its interval: still a gap
+
+    def test_a_one_off_docker_failure_retries_at_the_next_sample(self):
+        files = proc_files(900, 1, 'prog', '/system.slice/prog.service', 10 * MiB, 0)
+        outcomes = [hmon.subprocess.CalledProcessError(1, 'docker'), mock.Mock(stdout='')]
+        with mock.patch.object(hmon.subprocess, 'run', side_effect=outcomes) as run, \
+                mock.patch.object(hmon.logging, 'warning'):
+            self.collect_samples(2, files, which='/usr/bin/docker')
+        self.assertEqual(run.call_count, 2)
+
+    def test_browsing_the_past_stops_scanning_proc(self):
+        data_dir = self.history()
+
+        class Counting(Live):
+            calls = 0
+
+            def sample(self):
+                Counting.calls += 1
+                return super().sample()
+
+        c = hmon.curses
+        frames = browse(data_dir, [c.KEY_LEFT, -1, -1, c.KEY_RIGHT, -1], sampler=Counting())
+        self.assertEqual(Counting.calls, 2)  # at the start and back on the newest bar, none while in the past
+        self.assertIn('live', frames[-1].split('\n')[2])
 
     def test_collect_from_a_host_then_browse_apps_and_containers(self):
         data_dir = os.path.join(self.dir.name, 'data')
@@ -473,7 +543,7 @@ class EndToEnd(unittest.TestCase):
                 self.start = target
 
         with mock.patch.object(hmon, 'VERSION', '0.2.4'), mock.patch.object(hmon.threading, 'Thread', Inline), \
-                mock.patch.object(hmon.urllib.request, 'urlopen', side_effect=github), \
+                mock.patch('urllib.request.urlopen', side_effect=github), \
                 contextlib.redirect_stdout(io.StringIO()) as progress:
             bar = browse(data_dir, [])[0].split('\n')[45]
             with mock.patch.object(hmon.os, 'geteuid', return_value=1000), \
@@ -492,7 +562,7 @@ class EndToEnd(unittest.TestCase):
         self.assertIn('Downloading the hmon 0.2.5 installer...', progress.getvalue())  # a slow step shows where it is
 
         with mock.patch.object(hmon, 'VERSION', '0.2.5'), \
-                mock.patch.object(hmon.urllib.request, 'urlopen', side_effect=github), \
+                mock.patch('urllib.request.urlopen', side_effect=github), \
                 contextlib.redirect_stdout(io.StringIO()) as out:
             hmon.main(['update'])
         self.assertIn('hmon 0.2.5 is up to date.', out.getvalue())
@@ -552,6 +622,9 @@ class EndToEnd(unittest.TestCase):
                 laptop = browse(data_dir, [ord('\t')] * 6, sampler=Live())
             with mock.patch.object(hmon, 'virtual_machine', return_value='amazon'):
                 ec2 = browse(data_dir, [ord('\t')] * 4, sampler=Live())
+            with mock.patch.object(hmon, 'virtual_machine', return_value='amazon') as machine:
+                browse(data_dir, [ord('\t')] * 4 + [ord('x')] * 3, sampler=Live())
+            self.assertEqual(machine.call_count, 1)  # the reason isn't worked out again on every frame
         self.assertIn('No temperature readings: install lm-sensors', laptop[4])  # in the middle of the empty graph
         self.assertIn('No CPU power readings: this CPU or kernel has no RAPL energy counters', laptop[5])
         self.assertIn('No battery here', laptop[6])

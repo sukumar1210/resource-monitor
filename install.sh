@@ -126,6 +126,9 @@ After=docker.service
 Environment=HMON_INTERVAL=${INTERVAL}
 Environment=HMON_METRICS=${METRICS}
 ExecStart=/usr/local/bin/hmon collect
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
 Restart=always
 RestartSec=10
 

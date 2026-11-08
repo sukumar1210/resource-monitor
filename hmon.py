@@ -11,7 +11,6 @@ import contextlib
 import csv
 import glob
 import io
-import json
 import locale
 import logging
 import math
@@ -20,15 +19,13 @@ import re
 import shutil
 import signal
 import socket
-import sqlite3
 import subprocess
 import sys
-import tarfile
 import tempfile
 import textwrap
 import threading
 import time
-import urllib.request
+# json, sqlite3, tarfile and urllib.request are imported where used: the long-running collector never needs them
 from array import array
 from bisect import bisect_left
 from collections import defaultdict, namedtuple
@@ -59,6 +56,8 @@ SECRETS = [
     (re.compile(r'(?i)((?:pass|pwd|secret|token|key|auth)[\w-]*=)[^\s&]+'), r'\1***'),            # password=X, ?token=X
     (re.compile(r'(?i)(-[\w-]*(?:pass|pwd|secret|token|key|auth)[\w-]*\s+)[^\s-]\S*'), r'\1***'),  # --password X
 ]
+MASKED_CHARS = 1024  # how much of a command line is masked and kept from; the patterns slow down sharply with length
+DOCKER_MAX_WAIT = 10  # most samples to skip while docker stats keeps failing, as when the daemon is stopped
 
 # Columns are only ever added at the end, and readers take the columns they know by position, so files written
 # before and after an update stay readable.
@@ -252,8 +251,12 @@ def sample_processes(ts, prev, container_names):
 
 
 def command_line(pid):
-    """A process's command line as hmon stores it: on one line, credentials masked, at most 200 characters."""
+    """A process's command line as hmon stores it: on one line, credentials masked, at most 200 characters. Only its
+    start is masked, since anyone can start a process with huge arguments; a word the cut splits goes too, so half a
+    password can't survive."""
     cmdline = read_text(f'/proc/{pid}/cmdline').replace('\0', ' ').replace('\n', ' ').strip()
+    if len(cmdline) > MASKED_CHARS:
+        cmdline = cmdline[:MASKED_CHARS].rsplit(' ', 1)[0]
     for pattern, replacement in SECRETS:
         cmdline = pattern.sub(replacement, cmdline)
     return cmdline[:200]
@@ -278,6 +281,7 @@ def collect():
     has_docker = shutil.which('docker') is not None
     prev_cpu_ticks, prev_procs, container_names, prev_energy = None, None, {}, None
     metrics = [name for name in os.environ.get('HMON_METRICS', '').split(',') if name in EXTRA_METRICS]
+    docker_wait, docker_failures = 0, 0
     while True:
         started = time.monotonic()
         now = datetime.now(timezone.utc)
@@ -290,18 +294,25 @@ def collect():
             append('host', HOST_FIELDS, [row], day)
         except Exception:
             logging.exception('host sample failed')
-        if has_docker:
+        if has_docker and docker_wait:
+            docker_wait -= 1
+        elif has_docker:
             try:
                 rows, container_names = sample_containers(ts)
                 append('containers', CONTAINER_FIELDS, rows, day)
-            except Exception:
-                logging.exception('container sample failed')
+                docker_failures = 0
+            except Exception as error:
+                if not docker_failures:  # once, not a traceback per sample into the journal
+                    logging.warning('docker stats failed; backing off while it keeps failing: %s', error)
+                docker_wait = min(docker_failures, DOCKER_MAX_WAIT)  # a one-off under load retries at once
+                docker_failures += 1
         try:
             rows, prev_procs = sample_processes(ts, prev_procs, container_names)
             append('processes', PROCESS_FIELDS, rows, day)
         except Exception:
             logging.exception('process sample failed')
-        time.sleep(max(0, INTERVAL_SECONDS - (time.monotonic() - started)))
+        # a slow sample still leaves a gap, so a stalled docker or a tiny interval can't keep the loop running flat out
+        time.sleep(max(1, INTERVAL_SECONDS / 2, INTERVAL_SECONDS - (time.monotonic() - started)))
 
 
 # ---------------------------------------------------------------- times and zones
@@ -575,9 +586,14 @@ class Store:
         self.live_rows[t] = [['' if value is None else str(value) for value in row] for row in process_rows]
         for old in [s for s in self.live_host if s < t - LIVE_HOST_SECONDS]:
             del self.live_host[old]
+            if old not in self.host:
+                del self.times[bisect_left(self.times, old)]
         for old in [s for s in self.live_rows if s < t - LIVE_PROCESS_SECONDS]:
             del self.live_rows[old]
-        self.times = sorted(set(self.host) | set(self.live_host))
+        if not self.times or t > self.times[-1]:  # the usual case: the newest yet
+            self.times.append(t)
+        elif self.times[bisect_left(self.times, t)] != t:
+            self.times.insert(bisect_left(self.times, t), t)
 
     def host_samples(self, start, end):
         times = self.times[bisect_left(self.times, start):bisect_left(self.times, end)]
@@ -617,6 +633,10 @@ class LiveSampler:
         self.store = store
         self.prev_ticks = self.prev_procs = self.prev_energy = None
         self.metrics = recording()[2]  # the opt-in ones the service records, read here too where this user can
+
+    def pause(self):
+        """Forgets the last reading, so CPU % on coming back isn't an average over the time away."""
+        self.prev_ticks = self.prev_procs = self.prev_energy = None
 
     def sample(self):
         """(time, host row, process rows) for now; CPU % is over the time since the previous call."""
@@ -1256,6 +1276,7 @@ class Viewer:
         self.index, self.selected, self.scroll, self.page = 0, None, 0, 10
         self.rows, self.width, self.graph_w, self.table_top, self.cursor_x = [], 80, 10, 0, 0
         self.live_t, self.step, self.live_cache = None, 1, (None, None)
+        self.reasons = {}  # why each empty opt-in graph is empty, until the next reload
         self.next_reload = time.monotonic() + RELOAD_SECONDS
         self.cursor = self.view_end = self.align(self.store.times[-1])
 
@@ -1415,7 +1436,10 @@ class Viewer:
         """Every refresh delay: a live sample (htop-style), and every RELOAD_SECONDS the newly recorded ones."""
         last = self.store.times[-1]
         following = self.cursor == self.align(last)
-        if self.sampler:
+        if self.sampler and not following and self.anchor is None:  # browsing the past: nothing live is on screen
+            self.sampler.pause()
+            self.live_t = None
+        elif self.sampler:
             try:
                 self.live_t, host_row, rows = self.sampler.sample()
                 self.store.add_live(self.live_t, host_row, rows)
@@ -1424,6 +1448,7 @@ class Viewer:
         if time.monotonic() >= self.next_reload:
             self.store.reload()
             self.columns.clear()
+            self.reasons.clear()
             self.graph_values.clear()
             self.next_reload = time.monotonic() + RELOAD_SECONDS
         else:  # only columns that can hold the new samples change
@@ -1584,7 +1609,9 @@ class Viewer:
             if (start + self.shift) % LABEL_EVERY[self.zoom] == 0:
                 self.put(axis + 1, 6 + col, label(start, time_format), 'shadow')
         if self.metric in EXTRA_METRICS.values() and all(value is None for value in values):
-            lines = textwrap.wrap(self.no_readings(self.metric), max(10, self.graph_w - 4))
+            if self.metric not in self.reasons:
+                self.reasons[self.metric] = self.no_readings(self.metric)
+            lines = textwrap.wrap(self.reasons[self.metric], max(10, self.graph_w - 4))
             for i, line in enumerate(lines):  # in the middle of the empty graph
                 self.put(top + 1 + (graph_h - len(lines)) // 2 + i, 6 + (self.graph_w - len(line)) // 2, line, 'value')
 
@@ -2052,6 +2079,7 @@ class Viewer:
             notices.append(f'Settings saved to {CONFIG_PATH}.')
         except OSError as error:
             notices.append(f'Could not save the settings: {error}.')
+        self.reasons.clear()
         self.notice = '  '.join(notices)
         self.blocking(False)
 
@@ -2627,6 +2655,7 @@ def open_source(source):
     """A data directory, or a dump from `hmon export`, unpacked to a temporary directory removed at exit."""
     if not (os.path.isfile(source) and source.endswith(('.tar.gz', '.tgz'))):
         return source
+    import tarfile
     folder = tempfile.mkdtemp(prefix='hmon-dump-')
     atexit.register(shutil.rmtree, folder, True)
     with tarfile.open(source) as archive:
@@ -2656,6 +2685,7 @@ def rows_in_range(path, start, end):
 def write_dump(csv_dir, start, end, output):
     """A .tar.gz of the samples in [start, end], to open anywhere with `hmon FILE` or unpack for other tools.
     Rows stream through a temporary file per day, so memory stays flat whatever the range."""
+    import tarfile
     with tempfile.TemporaryDirectory() as folder, tarfile.open(output, 'w:gz') as archive:
         for kind in ('host', 'containers', 'processes'):
             for name, path in files_in_range(csv_dir, kind, start, end):
@@ -2693,6 +2723,8 @@ CREATE INDEX processes_by_time ON processes (time);
 def to_sqlite(csv_dir, start, end, path):
     """The samples in [start, end] as SQLite tables host, containers and processes; each process row carries the
     app hmon groups it under, so `GROUP BY app` works."""
+    import sqlite3
+
     def host_values(row):
         ts, cpu, load_1m, total, available, swap_used, load_5m, load_15m, swap_total, temps, cpu_w, battery_w = \
             (row + [''] * 12)[:12]
@@ -2746,6 +2778,8 @@ def check_readable(csv_dir):
 
 def newest_release(timeout):
     """The newest release's version, e.g. 0.2.5, or None when GitHub can't be reached."""
+    import json
+    import urllib.request
     try:
         with urllib.request.urlopen(f'https://api.github.com/repos/{REPO}/releases/latest', timeout=timeout) as reply:
             return json.load(reply)['tag_name'].lstrip('v')
@@ -2826,6 +2860,7 @@ def update():
         as_root(['update'])
     url = f'https://github.com/{REPO}/releases/download/v{newest}/install.sh'
     print(f'Downloading the hmon {newest} installer...', flush=True)
+    import urllib.request
     try:
         with urllib.request.urlopen(url, timeout=120) as reply:
             installer = reply.read()
@@ -2944,6 +2979,7 @@ def main(argv):
         handle, database = tempfile.mkstemp(prefix='hmon-', suffix='.db')  # on disk, so memory stays flat
         os.close(handle)
         atexit.register(os.remove, database)
+        import sqlite3
         try:
             with contextlib.closing(to_sqlite(csv_dir, start, end, database)) as connection:
                 run_query(connection, words[1])

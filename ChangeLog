@@ -1,3 +1,12 @@
+What's new in version 0.2.16
+
+* A process with huge arguments can no longer pin hmon on a CPU core: only the start of a command line is masked
+* With docker installed but stopped, the collector backs off to about every 10 samples and logs it once, not on every
+  sample; a one-off failure retries at the next sample
+* A slow sample still leaves a gap before the next one
+* The collector runs at low CPU and disk priority, and no longer loads the heavy modules it doesn't need
+* The viewer stops reading /proc while you browse past bars
+
 What's new in version 0.2.15
 
 * Kill (F9 or k), as in htop: a signal for the selected process, sent only while its PID still runs the command the
