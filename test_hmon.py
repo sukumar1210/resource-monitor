@@ -361,7 +361,7 @@ class EndToEnd(unittest.TestCase):
     def test_hovering_a_bar_shows_its_tooltip(self):
         data_dir = self.history()
         c = hmon.curses
-        screen = FakeScreen([c.KEY_MOUSE, -1])  # the pointer moves onto a bar, then rests there
+        screen = FakeScreen([c.KEY_MOUSE, ord('v'), -1])  # the pointer moves onto a bar; v; it rests there
         terminal = io.StringIO()  # an X10 terminfo, so hmon reads the reports and hovers work on any ncurses
         with mock.patch.object(c, 'mousemask'), mock.patch.object(c, 'mouseinterval'), \
                 mock.patch.object(c, 'tigetstr', return_value=b'\x1b[M'), \
@@ -369,19 +369,24 @@ class EndToEnd(unittest.TestCase):
                 contextlib.redirect_stdout(terminal):
             hmon.Viewer(screen, hmon.Store(data_dir), dict(hmon.DEFAULTS, tz='UTC'), None, use_color=False).run()
         self.assertIn('\x1b[?1003h', terminal.getvalue())  # every move is reported, so hover can be seen
-        moved, rested = screen.frames[1], screen.frames[2]
+        moved, switched, rested = screen.frames[1], screen.frames[2], screen.frames[3]
         for statistic in ('Average', 'Maximum', 'Minimum'):
             self.assertRegex(moved, statistic + r'\s+[\d.]+%')  # the bar's memory, at once
-        self.assertNotIn('▸ docker', moved)
-        self.assertRegex(rested, r'▸ docker\s+320M')  # and once the pointer rests, its top 3 apps
+        self.assertIn('· 1 sample ', moved)  # a sample a minute: one per 1 min bar, so the three agree
+        self.assertIn('┌', moved.split('\n')[9][100:])  # just below the pointer, on row 8
+        self.assertNotIn('┌', moved.split('\n')[8][100:])
+        self.assertNotIn('▸ docker', moved)  # v: the top apps instead, read once the pointer rests
+        self.assertIn('reading...', switched)
+        self.assertNotIn('│ Average', rested)  # the top apps instead of the statistics, not below them
+        self.assertRegex(rested, r'▸ docker\s+320M')
         self.assertRegex(rested, r'▸ ssh')
 
     def test_a_pinned_tooltip_walks_the_table(self):
         data_dir = self.history()
         c = hmon.curses
         click = [(0, 100, 8, 0, c.BUTTON1_PRESSED), (0, 100, 8, 0, c.BUTTON1_RELEASED)]
-        frames = browse(data_dir, [c.KEY_MOUSE, c.KEY_MOUSE, c.KEY_DOWN, 27], clicks=click)
-        pinned, down, closed = frames[2], frames[3], frames[4]
+        frames = browse(data_dir, [ord('v'), c.KEY_MOUSE, c.KEY_MOUSE, c.KEY_DOWN, 27], clicks=click)  # top apps
+        pinned, down, closed = frames[3], frames[4], frames[5]
         self.assertIn('▾ docker', pinned)  # the click pins the bar's tooltip, its first app selected...
         self.assertRegex(pinned, r'[├└]\+ openalgo')  # ...and unfolded in the table
         self.assertIn('▾ leak', down)  # Down: the next app; the table follows
@@ -566,7 +571,7 @@ class EndToEnd(unittest.TestCase):
                     hmon.main(command[3:])
             return mock.Mock(returncode=0)
 
-        to_temperature = [hmon.curses.KEY_F2] + [hmon.curses.KEY_DOWN] * 9
+        to_temperature = [hmon.curses.KEY_F2] + [hmon.curses.KEY_DOWN] * 11
         with mock.patch.object(hmon, 'UNIT_PATH', unit), mock.patch.object(hmon, 'TMPFILES_PATH', rule), \
                 mock.patch.object(hmon.os, 'geteuid', return_value=1000), mock.patch.object(hmon.curses, 'endwin'), \
                 mock.patch.object(hmon.subprocess, 'run', side_effect=run) as ran, \
@@ -574,17 +579,64 @@ class EndToEnd(unittest.TestCase):
             frames = browse(data_dir, to_temperature + [hmon.curses.KEY_RIGHT, hmon.curses.KEY_RIGHT, 27])
             sudo_calls = len(ran.call_args_list)
             hiding = browse(data_dir, to_temperature + [hmon.curses.KEY_LEFT, 27])  # on -> record only
-        self.assertRegex(frames[11], r'Temperature\s+record only\s+recorded \(every sensor, in °C\), no graph tab')
-        self.assertRegex(frames[12], r'Temperature\s+on\s+recorded \(every sensor, in °C\), with a graph tab')
+        self.assertRegex(frames[13], r'Temperature\s+record only\s+recorded \(every sensor, in °C\), no graph tab')
+        self.assertRegex(frames[14], r'Temperature\s+on\s+recorded \(every sensor, in °C\), with a graph tab')
         self.assertEqual(ran.call_args_list[0][0][0][:2], ['sudo', sys.executable])  # not root: sudo, off the screen
-        self.assertIn('The recording changed', frames[13])
-        self.assertIn(' Swap   Temp ', frames[13])  # and its tab is there at once
+        self.assertIn('The recording changed', frames[15])
+        self.assertIn(' Swap   Temp ', frames[15])  # and its tab is there at once
         self.assertEqual(len(ran.call_args_list), sudo_calls)  # record only is this viewer's choice: no sudo
         self.assertNotIn(' Temp ', hiding[-1])  # its tab is gone...
         with open(unit) as f:
             self.assertIn('Environment=HMON_METRICS=temperature\n', f.read())  # ...but it's still recorded
         with open(hmon.CONFIG_PATH) as f:
             self.assertIn('hidden=temperature', f.read())
+
+    def test_the_tooltip_shows_the_statistics_chosen_in_setup(self):
+        data_dir = self.history()
+        c = hmon.curses
+        keys = ([c.KEY_F2] + [c.KEY_DOWN] * 8 + [10, ord(' ')] + [c.KEY_DOWN] * 4 + [ord(' '), 10, 27]  # untick
+                + [c.KEY_MOUSE, c.KEY_MOUSE])  # Average, tick p90; then a click pins a bar's tooltip
+        click = [(0, 140, 8, 0, c.BUTTON1_PRESSED), (0, 140, 8, 0, c.BUTTON1_RELEASED)]  # on the recorded bars
+        frames = browse(data_dir, [ord('['), ord('[')] + keys, clicks=click)  # 15 min bars: 15 samples each
+        self.assertRegex(frames[13], r'\[ \] Average')  # Space unticks it
+        self.assertRegex(frames[13], r'\[x\] Maximum')
+        self.assertRegex(frames[18], r'\[x\] p90')  # and ticks p90
+        self.assertRegex(frames[-1], r'Maximum\s+[\d.]+%')
+        self.assertRegex(frames[-1], r'p90\s+[\d.]+%')
+        self.assertNotIn('Average  ', frames[-1].split('PID')[0].split('Memory   CPU')[1])  # not in the tooltip
+        self.assertIn('· 15 samples ', frames[-1])
+        with open(hmon.CONFIG_PATH) as f:
+            self.assertIn('tooltip_stats=Maximum,Minimum,p90', f.read())
+
+    def test_kill_signals_a_process_that_still_runs(self):
+        data_dir = self.history()
+        c = hmon.curses
+        keys = [ord('t'), c.KEY_HOME, ord('k'), 10]  # list view; the first (biggest) process; F9's k; SIGTERM
+        commands = {'/proc/600/cmdline': 'python\0app.py'}  # pid 600 still runs what the table shows
+        with mock.patch.object(hmon, 'read_text', side_effect=lambda path: commands.get(path, '')), \
+                mock.patch.object(hmon.os, 'kill') as kill:
+            frames = browse(data_dir, keys)
+        self.assertIn('F9 Kill', frames[0])
+        self.assertIn('Send a signal to 600', frames[3])
+        self.assertRegex(frames[3], r'15\s+SIGTERM')
+        kill.assert_called_once_with(600, hmon.signal.SIGTERM)
+        self.assertIn('Sent SIGTERM to 600 (python app.py).', frames[4])
+
+        commands['/proc/600/cmdline'] = 'nginx\0-g'  # the pid now belongs to another program: nothing is sent
+        with mock.patch.object(hmon, 'read_text', side_effect=lambda path: commands.get(path, '')), \
+                mock.patch.object(hmon.os, 'kill') as kill:
+            frames = browse(data_dir, keys[:3])
+        kill.assert_not_called()
+        self.assertIn("PID 600 no longer runs 'python app.py', so nothing was signalled.", frames[3])
+
+        commands['/proc/600/cmdline'] = 'python\0app.py'  # another user's: sudo kill, off the screen
+        with mock.patch.object(hmon, 'read_text', side_effect=lambda path: commands.get(path, '')), \
+                mock.patch.object(hmon.os, 'kill', side_effect=PermissionError), mock.patch.object(c, 'endwin'), \
+                mock.patch.object(hmon.subprocess, 'run', return_value=mock.Mock(returncode=0)) as run, \
+                contextlib.redirect_stdout(io.StringIO()):
+            frames = browse(data_dir, keys + [c.KEY_DOWN])
+        run.assert_called_once_with(['sudo', 'kill', '-s', 'TERM', '600'])
+        self.assertIn('Sent SIGTERM to 600 with sudo.', frames[4])
 
     def test_setup_changes_what_the_installer_asked(self):
         data_dir = self.history()
@@ -595,7 +647,7 @@ class EndToEnd(unittest.TestCase):
         with open(rule, 'w') as f:
             f.write('d /var/lib/hmon 0755 root root 14d\n')
         down = hmon.curses.KEY_DOWN
-        keys = ([hmon.curses.KEY_F2] + [down] * 6 + [hmon.curses.KEY_RIGHT, down, hmon.curses.KEY_LEFT, down, 10,
+        keys = ([hmon.curses.KEY_F2] + [down] * 6 + [hmon.curses.KEY_RIGHT] + [down] * 3 + [hmon.curses.KEY_LEFT, down, 10,
                 ord('7'), 10, 27])
         with mock.patch.object(hmon, 'UNIT_PATH', unit), mock.patch.object(hmon, 'TMPFILES_PATH', rule), \
                 mock.patch.object(hmon.os, 'geteuid', return_value=0), \
@@ -611,9 +663,9 @@ class EndToEnd(unittest.TestCase):
         self.assertRegex(frames[1], r'Temperature\s+off\s+not recorded')  # the opt-in metrics, in Recording
         self.assertRegex(frames[1], r'Battery draw\s+off')
         self.assertRegex(frames[8], r'Mouse\s+off\s+the terminal selects text')  # Right steps through the choices
-        self.assertRegex(frames[10], r'Sample every\s+30 s')
-        self.assertRegex(frames[13], r'7 days\s+about [\d,]+ MB in all')  # the retention dropdown, filtered
-        self.assertIn('Recording every 30 s, kept 7 days, with no opt-in metrics; the hmon service restarted.', frames[15])
+        self.assertRegex(frames[12], r'Sample every\s+30 s')
+        self.assertRegex(frames[15], r'7 days\s+about [\d,]+ MB in all')  # the retention dropdown, filtered
+        self.assertIn('Recording every 30 s, kept 7 days, with no opt-in metrics; the hmon service restarted.', frames[17])
         with open(hmon.CONFIG_PATH) as f:
             self.assertIn('mouse=off', f.read())
         with open(unit) as f:

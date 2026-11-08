@@ -18,6 +18,7 @@ import math
 import os
 import re
 import shutil
+import signal
 import socket
 import sqlite3
 import subprocess
@@ -245,12 +246,17 @@ def sample_processes(ts, prev, container_names):
         cgroup = read_text(f'/proc/{pid}/cgroup')
         match = CONTAINER_ID.search(cgroup)
         container = container_names.get(match.group(0), match.group(0)[:12]) if match else ''
-        cmdline = read_text(f'/proc/{pid}/cmdline').replace('\0', ' ').replace('\n', ' ').strip()  # one row per line
-        for pattern, replacement in SECRETS:
-            cmdline = pattern.sub(replacement, cmdline)
-        rows.append([ts, pid, container, proc.name, proc.rss_bytes, cpu_percent.get(key), cmdline[:200], proc.ppid,
+        rows.append([ts, pid, container, proc.name, proc.rss_bytes, cpu_percent.get(key), command_line(pid), proc.ppid,
                      cgroup_path(cgroup)])
     return rows, (procs, read_at)
+
+
+def command_line(pid):
+    """A process's command line as hmon stores it: on one line, credentials masked, at most 200 characters."""
+    cmdline = read_text(f'/proc/{pid}/cmdline').replace('\0', ' ').replace('\n', ' ').strip()
+    for pattern, replacement in SECRETS:
+        cmdline = pattern.sub(replacement, cmdline)
+    return cmdline[:200]
 
 
 def append(kind, fields, rows, day):
@@ -1064,6 +1070,10 @@ def opt_in_text(state, meaning):
             'on': f'recorded ({meaning}), with a graph tab'}[state]
 
 
+# htop's signal list, its default first
+SIGNALS = ['SIGTERM', 'SIGKILL', 'SIGHUP', 'SIGINT', 'SIGQUIT', 'SIGUSR1', 'SIGUSR2', 'SIGSTOP', 'SIGCONT']
+
+
 def metric_text(metric, value):
     """A graph tab's value as its tooltip shows it."""
     if value is None:
@@ -1175,13 +1185,16 @@ def configure_recording(interval, days, metrics):
 def megabytes_per_day(interval, processes):
     return 86400 / interval * processes * SAMPLE_BYTES / 1e6
 DEFAULTS = {'tz': 'system', 'statistic': 'Average', 'granularity': '60', 'graph': 'Memory', 'delay': '15',
-            'view': 'tree', 'sort': 'MEM%', 'mouse': 'on', 'hidden': ''}
+            'view': 'tree', 'sort': 'MEM%', 'mouse': 'on', 'hidden': '', 'tooltip': 'stats',
+            'tooltip_stats': 'Average,Maximum,Minimum'}
 VALID = {'tz': valid_zone, 'statistic': lambda v: v in STATISTICS,
          'granularity': lambda v: v.isdigit() and int(v) in ZOOM_LEVELS,
          'graph': lambda v: v in METRICS or v in EXTRA_METRICS.values(),
          'delay': lambda v: v.isdigit() and int(v) > 0, 'view': lambda v: v in ('tree', 'list'),
          'sort': lambda v: v in SORT_COLUMNS, 'mouse': lambda v: v in ('on', 'off'),
-         'hidden': lambda v: all(name in EXTRA_METRICS for name in v.split(',') if name)}  # recorded, no graph tab
+         'hidden': lambda v: all(name in EXTRA_METRICS for name in v.split(',') if name),  # recorded, no graph tab
+         'tooltip': lambda v: v in ('stats', 'apps'),
+         'tooltip_stats': lambda v: bool(v) and all(name in STATISTICS for name in v.split(','))}
 
 
 def load_settings():
@@ -1224,12 +1237,13 @@ class Viewer:
         self.own_sgr, self.sgr_event, self.blocked = False, None, False  # SGR mouse reports hmon reads itself
         # the tooltip: the bar under the pointer, or a pinned one with a selection the table follows
         self.hover, self.hover_bar, self.pin, self.pin_index = False, None, None, 0
-        self.tip_cells, self.tip_rows, self.tip_pending, self.tip_opened = [], {}, False, None
+        self.tip_cells, self.tip_rows, self.tip_pending, self.tip_opened, self.tip_y = [], {}, False, None, None
         self.anchor, self.bar_starts, self.graph_area = None, None, None  # a range of bars, from anchor to the marker
         self.glyphs = GLYPHS if unicode else ASCII_GLYPHS
         self.styles = self.make_styles(use_color and curses.has_colors())
         self.columns, self.graph_values = {}, {}  # caches, by column start and the settings that shape them
         self.hidden = {name for name in settings['hidden'].split(',') if name}  # opt-in metrics set to record only
+        self.tip_view, self.tip_stats = settings['tooltip'], settings['tooltip_stats'].split(',')
         self.metrics = self.graph_tabs()
         self.statistic = settings['statistic']
         self.metric = settings['graph'] if settings['graph'] in self.metrics else 'Memory'
@@ -1287,7 +1301,8 @@ class Viewer:
     def settings(self):
         return {'tz': self.tz, 'statistic': self.statistic, 'granularity': str(self.zoom), 'graph': self.metric,
                 'delay': str(self.delay), 'view': 'tree' if self.tree else 'list', 'sort': self.sort_key,
-                'mouse': 'on' if self.mouse_on else 'off', 'hidden': ','.join(sorted(self.hidden))}
+                'mouse': 'on' if self.mouse_on else 'off', 'hidden': ','.join(sorted(self.hidden)),
+                'tooltip': self.tip_view, 'tooltip_stats': ','.join(self.tip_stats)}
 
     def apply_mouse(self):
         """Mouse on: clicks go to hmon and a drag selects text through hmon; holding Shift (Option in iTerm2) lets the
@@ -1552,7 +1567,7 @@ class Viewer:
         self.put(axis, 1, f'{marks[2]:>4}' + g['corner'] + g['hline'] * self.graph_w)
         for row in range(top + 1, axis):
             self.put(row, 5, g['vert'])
-        self.regions.append((top + 1, axis + 1, 6, 6 + self.graph_w, lambda cx, cy: self.click_bar(starts[cx - 6])))
+        self.regions.append((top + 1, axis + 1, 6, 6 + self.graph_w, lambda cx, cy: self.click_bar(starts[cx - 6], cy)))
         self.graph_area = (top + 1, axis, starts)
         time_format = bar_format(self.zoom)
         for col, (start, value) in enumerate(zip(starts, values)):
@@ -1654,6 +1669,7 @@ class Viewer:
             items = [('F1', 'Help', curses.KEY_F1), ('F2', 'Setup', curses.KEY_F2), ('F3', 'Search', curses.KEY_F3),
                      ('F4', 'FILTER' if self.filter else 'Filter', curses.KEY_F4),
                      ('F5', 'List' if self.tree else 'Tree', curses.KEY_F5), ('F6', 'SortBy', curses.KEY_F6),
+                     ('F9', 'Kill', curses.KEY_F9),
                      ('F10', 'Quit', curses.KEY_F10), (g['left_right'], 'Time', None), ('[ / ]', 'Zoom', ord('[')),
                      ('s', 'Stat', ord('s')), ('g', 'GoTo', ord('g')), ('Tab', 'Graph', ord('\t'))]
             prompt = text = None
@@ -1663,7 +1679,7 @@ class Viewer:
             return
         update = ' New update available, Run: "hmon update" ' if self.update_available and prompt is None else ''
         right = width - 1 - len(update)  # the notice sits at the bottom right, and keys that would reach it make way
-        spans = self.put_keys(y, [(key, name) for key, name, _ in items], right - 3)
+        spans = self.put_keys(y, [(key, name) for key, name, _ in items], right - 3 if update else None)
         for (x0, x1), (_, _, code) in zip(spans, items):
             if code is not None:
                 self.regions.append((y, y, x0, x1, lambda cx, cy, c=code: self.press(c)))
@@ -1766,13 +1782,13 @@ class Viewer:
                 ('^ ^A', 'oldest sample'), ('$ ^E', 'newest sample (live)'), ('g', 'go to 12/10/2026 14:30 IST'),
                 ('[ ]', 'coarser / finer: 10 s .. 1 day'), ('s', 'statistic: avg max min p50/90/99'),
                 ('Tab S-Tab', 'graph: memory, CPU, load, swap, opt-ins'), ('Space', 'a range of bars, a table column each'),
-                ('i', 'pin the marker bar\'s tooltip (hover shows it)'),
+                ('i', 'pin the marker bar\'s tooltip (hover shows it)'), ('v', 'tooltip: statistics / top apps'),
                 ('Esc', 'back to one bar'), ('F2', 'setup: zone, defaults, recording')]
         right = [(g['up_down'], 'select a row'), ('PgUp PgDn', 'page through the rows'), ('Home End', 'first / last row'),
                  ('+ -', 'unfold / fold the selected app'), ('Enter', 'unfold or fold it'),
                  ('* c', 'fold / unfold everything'),
                  ('F3 /', 'search'), ('F4 \\', 'filter (\'|\' separates terms)'), ('F5 t', 'tree / list view'),
-                 ('F6 < >', 'choose the sort column'), ('M P N', 'sort by MEM% / CPU% / PID'),
+                 ('F6 < >', 'choose the sort column'), ('F9 k', 'send a signal to the process'), ('M P N', 'sort by MEM% / CPU% / PID'),
                  ('I', 'invert the sort order'), ('F1 h ?', 'this help'), ('F10 q', 'quit')]
         for x, items in ((1, left), (48, right)):
             for i, (key, text) in enumerate(items):
@@ -1785,8 +1801,10 @@ class Viewer:
             pass  # the release of the click that opened help, or a press: wait for a whole click or a key
         self.blocking(False)
 
-    SETTINGS = ['Time zone', 'Statistic', 'Granularity', 'Graph', 'Refresh delay', 'View', 'Mouse', 'Sample every',
-                'Keep', 'Temperature', 'CPU power', 'Battery draw']
+    SETTINGS = ['Time zone', 'Statistic', 'Granularity', 'Graph', 'Refresh delay', 'View', 'Mouse', 'Tooltip',
+                'Tooltip stats', 'Sample every', 'Keep', 'Temperature', 'CPU power', 'Battery draw']
+    TIP_VIEWS = {'stats': "the bar's statistics; v switches to its top apps",
+                 'apps': 'its 3 biggest apps on Memory and CPU; v switches back'}
     OPT_INS = {'Temperature': ('temperature', 'every sensor, in °C'),
                'CPU power': ('cpu-power', 'the CPU package, in watts (RAPL)'),
                'Battery draw': ('battery', 'watts from the battery while unplugged')}
@@ -1822,6 +1840,10 @@ class Viewer:
             return ['tree', 'list'], 'tree' if self.tree else 'list', str, str
         if name == 'Mouse':
             return ['on', 'off'], 'on' if self.mouse_on else 'off', str, self.mouse_text
+        if name == 'Tooltip':
+            return list(self.TIP_VIEWS), self.tip_view, str, lambda v: f'{v:<7}{self.TIP_VIEWS[v]}'
+        if name == 'Tooltip stats':  # a checklist: Space ticks
+            return STATISTICS, self.tip_stats, ', '.join, str
         interval, days, metrics = self.recording
         if interval is None:
             return [], None, str, str
@@ -1845,6 +1867,8 @@ class Viewer:
             return f'{self.tz}   ({zone_label(self.tz)})'
         if name == 'Mouse':
             return self.mouse_text(current)
+        if name == 'Tooltip':
+            return f'{current:<7}{self.TIP_VIEWS[current]}'
         if name == 'Sample every':
             return f'{short(current)}   about {megabytes_per_day(current, self.process_count):,.0f} MB a day'
         if name == 'Keep':
@@ -1868,6 +1892,10 @@ class Viewer:
         elif name == 'Mouse':
             self.mouse_on = value == 'on'
             self.apply_mouse()
+        elif name == 'Tooltip':
+            self.tip_view = value
+        elif name == 'Tooltip stats':
+            self.tip_stats = value or self.tip_stats  # at least one
         elif name == 'Sample every':
             self.recording[0] = value
         elif name == 'Keep':
@@ -1878,10 +1906,11 @@ class Viewer:
             self.recording[2] = sorted(recorded - {metric} if value == 'off' else recorded | {metric})
             self.hidden = self.hidden | {metric} if value == 'record only' else self.hidden - {metric}
 
-    def choose(self, y, x, title, options, current, describe=str, backdrop=None):
+    def choose(self, y, x, title, options, current, describe=str, backdrop=None, ticked=None):
         """A dropdown at (y, x) over what `backdrop()` draws: arrows, PgUp/PgDn, Home/End or the wheel move, typing
         filters by anything a row shows (a zone's name, offset or abbreviation: kolk, +05:30 or ist), Enter or a click
-        picks, Esc or a click outside cancels. Returns the pick, or None."""
+        picks, Esc or a click outside cancels. Returns the pick, or None. With `ticked` (a set) it's a checklist:
+        Space or a click ticks and unticks, and Enter returns the ticked options in order."""
         query, index, top = '', options.index(current) if current in options else 0, 0
         while True:
             if backdrop:
@@ -1895,14 +1924,22 @@ class Viewer:
             heading = f' {title}: {query}' if query else f' {title}   (type to filter)'
             self.put(y, x, heading[:box].ljust(box), 'header')
             for i in range(rows):
-                text = f' {describe(shown[top + i])}' if top + i < len(shown) else ' no match'
+                option = shown[top + i] if top + i < len(shown) else None
+                tick = '' if ticked is None else '[x] ' if option in ticked else '[ ] '
+                text = f' {tick}{describe(option)}' if option is not None else ' no match'
                 self.put(y + 1 + i, x, text[:box].ljust(box), 'selected' if shown and top + i == index else 'normal')
             self.put(height - 1, 0, ' ' * (width - 1), 'label')
-            end = self.put_keys(height - 1, [('Enter', 'Pick'), ('Esc', 'Cancel')])[-1][1]
+            keys = [('Enter', 'Pick'), ('Esc', 'Cancel')] if ticked is None else [('Space', 'Tick'), ('Enter', 'Done'),
+                                                                                 ('Esc', 'Cancel')]
+            end = self.put_keys(height - 1, keys)[-1][1]
             self.put(height - 1, end + 2, 'type to filter', 'label')
             self.refresh()
             key = self.getch()
-            if key in (curses.KEY_UP, curses.KEY_DOWN):
+            if ticked is not None and key == ord(' ') and shown:
+                ticked ^= {shown[index]}
+            elif ticked is not None and key in (10, 13, curses.KEY_ENTER):
+                return [option for option in options if option in ticked]
+            elif key in (curses.KEY_UP, curses.KEY_DOWN):
                 index += 1 if key == curses.KEY_DOWN else -1
             elif key in (curses.KEY_PPAGE, curses.KEY_NPAGE):
                 index += rows if key == curses.KEY_NPAGE else -rows
@@ -1923,7 +1960,12 @@ class Viewer:
                 if event.kind == 'wheel':
                     index += 3 * event.step
                 elif y < event.y <= y + rows and x <= event.x < x + box:
-                    return shown[top + event.y - y - 1] if top + event.y - y - 1 < len(shown) else None
+                    if top + event.y - y - 1 >= len(shown):
+                        return None
+                    if ticked is None:
+                        return shown[top + event.y - y - 1]
+                    index = top + event.y - y - 1
+                    ticked ^= {shown[index]}
                 else:
                     return None
 
@@ -1965,7 +2007,7 @@ class Viewer:
                 choice = min(len(names) - 1, choice + 1)
             elif key in (curses.KEY_LEFT, curses.KEY_RIGHT):
                 options, current, _, _ = self.setting_options(names[choice])
-                if options:
+                if options and names[choice] != 'Tooltip stats':  # a checklist doesn't step
                     self.apply_setting(names[choice], cycle(options, current, 1 if key == curses.KEY_RIGHT else -1))
             elif key in (10, 13, curses.KEY_ENTER):
                 pick = True
@@ -1986,7 +2028,7 @@ class Viewer:
                 options, current, _, describe = self.setting_options(names[choice])
                 if options:
                     value = self.choose(self.setting_row(choice) + 1, 18, names[choice], options, current, describe,
-                                        draw)
+                                        draw, set(current) if names[choice] == 'Tooltip stats' else None)
                     if value is not None:
                         self.apply_setting(names[choice], value)
         notices = []
@@ -2013,20 +2055,51 @@ class Viewer:
         self.notice = '  '.join(notices)
         self.blocking(False)
 
-    def configure_as_root(self, args):
-        """Runs `hmon ARGS` under sudo, outside the screen so sudo can ask for a password, then comes back; says how
-        it went."""
+    def with_sudo(self, why, command):
+        """Runs `command` under sudo, outside the screen so sudo can ask for a password, then comes back. Returns
+        whether it ran."""
         curses.endwin()
-        print(f'Changing the recording needs root: sudo hmon {" ".join(args)}', flush=True)
+        print(f'{why}: sudo {" ".join(command)}', flush=True)
         try:
-            done = subprocess.run(['sudo', sys.executable, os.path.abspath(sys.argv[0])] + args).returncode == 0
+            done = subprocess.run(['sudo'] + command).returncode == 0
         except (OSError, KeyboardInterrupt):  # no sudo, or Ctrl+C at its password prompt
             done = False
         self.screen.clear()  # back on the screen: everything is drawn again
         self.apply_mouse()
-        if done:
+        return done
+
+    def configure_as_root(self, args):
+        """Runs `hmon ARGS` under sudo; says how it went."""
+        if self.with_sudo('Changing the recording needs root', [sys.executable, os.path.abspath(sys.argv[0])] + args):
             return 'The recording changed; the hmon service restarted.'
         return f'The recording is unchanged: sudo didn\'t run it. To change it, run: hmon {" ".join(args)}'
+
+    def kill(self):
+        """htop's F9 Kill: a signal for the selected process, sent only while its PID still runs the command the
+        table shows (a PID from the past may belong to another program now). Another user's process asks sudo."""
+        row = self.rows[self.index] if self.rows else None
+        if row is None or row.kind != 'process':
+            self.notice = 'Select a process to send it a signal: F9 works on processes, not on apps or containers.'
+            return
+        pid, command = row.key[1], row.key[2]
+        if not command or command_line(pid) != command:
+            self.notice = f'PID {pid} no longer runs {(command or row.label)[:50]!r}, so nothing was signalled.'
+            return
+        name = self.choose(self.table_top, 0, f'Send a signal to {pid}', SIGNALS, 'SIGTERM',
+                           lambda signal_name: f'{int(getattr(signal, signal_name)):>2}  {signal_name}', self.draw)
+        if name is None:
+            return
+        if command_line(pid) != command:  # it may have ended while the list was open
+            self.notice = f'PID {pid} no longer runs {command[:50]!r}, so nothing was signalled.'
+            return
+        try:
+            os.kill(int(pid), getattr(signal, name))
+            self.notice = f'Sent {name} to {pid} ({command[:50]}).'
+        except ProcessLookupError:
+            self.notice = f'PID {pid} has ended.'
+        except PermissionError:
+            done = self.with_sudo(f'PID {pid} belongs to another user', ['kill', '-s', name[3:], str(pid)])
+            self.notice = f'Sent {name} to {pid} with sudo.' if done else f'{name} was not sent: sudo didn\'t run kill.'
 
     def pick_sort(self):
         """htop's Sort by panel."""
@@ -2242,7 +2315,11 @@ class Viewer:
             self.held = True  # only the tooltip changed, and hover_over has painted it
             return True
         if self.pin is not None:
-            if event.kind == 'click' and event.y in self.tip_rows and self.tip_box[1] <= event.x <= self.tip_box[3]:
+            inside = event.kind == 'click' and self.tip_box[1] <= event.x <= self.tip_box[3]
+            if inside and event.y == self.tip_box[0]:  # its title switches statistics and top apps
+                self.switch_tip()
+                return True
+            if inside and event.y in self.tip_rows:
                 self.pin_index = self.tip_rows[event.y]  # an app in the pinned tooltip: the table follows
                 self.follow(self.tip_apps(self.pin)[self.pin_index][0])
                 return True
@@ -2265,26 +2342,34 @@ class Viewer:
             return True
         return self.handle(key)
 
-    def click_bar(self, start):
+    def click_bar(self, start, y=None):
+        """The marker goes to the bar (or the nearest with data, as it would anyway) and its tooltip is pinned there."""
+        start = min(max(start, self.align(self.store.times[0])), self.align(self.store.times[-1]))
         self.cursor, self.anchor = start, None
-        self.pin_at(start)
+        self.pin_at(start, y)
 
     # ---- the graph's tooltip: a bar's Average, Maximum and Minimum, and on Memory and CPU its top 3 apps
 
     def hover_over(self, x, y):
         bar = self.bar_at(x) if self.on_graph((x, y)) else None
-        if bar != self.hover_bar:
-            self.hover_bar = bar
-            if self.pin is None:
-                self.draw_tip()
-                self.screen.refresh()
+        if (bar, y) != (self.hover_bar, self.tip_y) and self.pin is None:  # it follows the pointer
+            self.hover_bar, self.tip_y = bar, y
+            self.draw_tip()
+            self.screen.refresh()
 
-    def pin_at(self, start):
-        """Pins the tooltip of the bar at `start`: its first app is selected, and the table follows."""
-        self.pin, self.pin_index, self.hover_bar = start, 0, None
-        apps = self.tip_apps(start)
+    def pin_at(self, start, y=None):
+        """Pins the tooltip of the bar at `start`, by the pointer at row `y` (the middle of the graph from the
+        keyboard); in the apps view its first app is selected, and the table follows."""
+        self.pin, self.pin_index, self.hover_bar, self.tip_y = start, 0, None, y
+        apps = self.tip_apps(start) if self.tip_view == 'apps' else []
         if apps:
             self.follow(apps[0][0])
+
+    def switch_tip(self):
+        """v: the tooltip shows the bar's statistics, or its top apps (the table follows a pinned one's selection)."""
+        self.tip_view = 'apps' if self.tip_view == 'stats' else 'stats'
+        if self.pin is not None:
+            self.pin_at(self.pin, self.tip_y)
 
     def tip_apps(self, start):
         """The 3 apps that used the most of the tab's metric in the bar at `start`, as (name, value text); only Memory
@@ -2315,7 +2400,10 @@ class Viewer:
     def pinned_key(self, key):
         """A key for the pinned tooltip: Up/Down move its selection, which the table follows; Esc closes it. Any other
         key closes it and then does what it always does. Returns whether the tooltip took the key."""
-        apps = self.tip_apps(self.pin)
+        if key == ord('v'):
+            self.switch_tip()
+            return True
+        apps = self.tip_apps(self.pin) if self.tip_view == 'apps' else []
         if key in (curses.KEY_UP, curses.KEY_DOWN) and apps:
             self.pin_index = (self.pin_index + (1 if key == curses.KEY_DOWN else -1)) % len(apps)
             self.follow(apps[self.pin_index][0])
@@ -2331,39 +2419,45 @@ class Viewer:
         start = self.pin if self.pin is not None else self.hover_bar
         if start is None or self.graph_area is None or start not in self.graph_area[2]:
             return
+        apps_view = self.tip_view == 'apps' and self.metric in ('Memory', 'CPU')  # the others have no apps
         ready = (self.pin is not None or (start, self.zoom, self.statistic) in self.columns
                  or (self.live_t is not None and start <= self.live_t < start + self.zoom))
-        self.tip_pending = not ready and self.metric in ('Memory', 'CPU')
+        self.tip_pending = apps_view and not ready
         if self.tip_pending:
             self.screen.timeout(150)  # once the pointer rests that long, read the bar's apps
-        values = [metric_value(sample, self.metric) for sample in self.store.host_samples(start, start + self.zoom)]
-        rows = [(f' {statistic:<8} {metric_text(self.metric, aggregate(values, statistic))}', 'normal')
-                for statistic in ('Average', 'Maximum', 'Minimum')]
-        apps = self.tip_apps(start) if ready else []
-        g, (left, right, low_left, low_right, line, side, tee_left, tee_right) = self.glyphs, self.glyphs['box']
-        name_w = max([0] + [len(name) for name, _ in apps])
-        entries = [(f' {g["unfolded" if ("app", name) in self.toggled else "folded"]} {name:<{name_w}}  {value:>6}',
-                    'selected' if self.pin == start and i == self.pin_index else 'normal')
-                   for i, (name, value) in enumerate(apps)]
-        title = f' {label(start, bar_format(self.zoom))} '
-        width = max([len(title) + 2] + [len(text) + 1 for text, _ in rows + entries])
+        g, (left, right, low_left, low_right, line, side, _, _) = self.glyphs, self.glyphs['box']
+        when = label(start, bar_format(self.zoom))
+        if apps_view:
+            apps = self.tip_apps(start) if ready else []
+            name_w = max([0] + [len(name) for name, _ in apps])
+            rows = [(f' {g["unfolded" if ("app", name) in self.toggled else "folded"]} {name:<{name_w}}  {value:>6}',
+                     'selected' if self.pin == start and i == self.pin_index else 'normal')
+                    for i, (name, value) in enumerate(apps)] or [(' reading...', 'shadow')]
+            title = f' {when} · top {len(apps) or 3} '
+        else:
+            samples = self.store.host_samples(start, start + self.zoom)
+            values = [metric_value(sample, self.metric) for sample in samples]
+            width = max(len(statistic) for statistic in self.tip_stats)
+            rows = [(f' {statistic:<{width}}  {metric_text(self.metric, aggregate(values, statistic))}', 'normal')
+                    for statistic in self.tip_stats]
+            title = f' {when} · {len(samples)} sample{"" if len(samples) == 1 else "s"} '  # one sample: all alike
+        width = max([len(title) + 2] + [len(text) + 1 for text, _ in rows])
         lines = ([(left + title + line * (width - len(title)) + right, 'header')]
                  + [(side + text.ljust(width) + side, style) for text, style in rows]
-                 + ([(tee_left + line * width + tee_right, 'normal')] if entries else [])
-                 + [(side + text.ljust(width) + side, style) for text, style in entries]
                  + [(low_left + line * width + low_right, 'normal')])
-        top, _, starts = self.graph_area
-        column, screen_w = 6 + starts.index(start), self.screen.getmaxyx()[1]
+        top, axis, starts = self.graph_area
+        column, (screen_h, screen_w) = 6 + starts.index(start), self.screen.getmaxyx()
+        pointer = self.tip_y if self.tip_y is not None else (top + axis) // 2
+        y = pointer + 1 if pointer + 1 + len(lines) < screen_h - 1 else max(0, pointer - len(lines))  # by the pointer
         x = column + 2 if column + 2 + width + 2 < screen_w - 1 else max(0, column - width - 3)
         for i, (text, style) in enumerate(lines):
             try:
-                self.screen.addstr(top + i, x, text, self.styles[style])
+                self.screen.addstr(y + i, x, text, self.styles[style])
             except curses.error:
-                pass  # past the bottom of a small screen
-            self.tip_cells += [(top + i, x + j) for j in range(len(text))]
-        first = top + len(lines) - 1 - len(entries)
-        self.tip_rows = {first + i: i for i in range(len(entries))}
-        self.tip_box = (top, x, top + len(lines) - 1, x + width + 1)
+                pass  # past the edge of a small screen
+            self.tip_cells += [(y + i, x + j) for j in range(len(text))]
+        self.tip_rows = {y + 1 + i: i for i in range(len(rows))} if apps_view and ready else {}
+        self.tip_box = (y, x, y + len(lines) - 1, x + width + 1)
 
     def click_bar_title(self, start):
         self.cursor = start
@@ -2455,6 +2549,10 @@ class Viewer:
             self.cursor = self.store.times[-1]
         elif char == 'i':  # the marker's bar's tooltip, pinned
             self.pin_at(self.cursor)
+        elif char == 'v':
+            self.switch_tip()
+        elif key == curses.KEY_F9 or char == 'k':
+            self.kill()
         elif char == ' ':  # a range of bars from here, which the marker's moves stretch
             self.anchor = None if self.anchor is not None else self.cursor
         elif key == 27:

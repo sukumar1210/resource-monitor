@@ -1,3 +1,14 @@
+What's new in version 0.2.15
+
+* Kill (F9 or k), as in htop: a signal for the selected process, sent only while its PID still runs the command the
+  table shows; another user's process asks sudo
+* The tooltip opens by the pointer, and shows either the bar's statistics or its top apps: v (or a click on a pinned
+  tooltip's title) switches, and F2 Setup's Tooltip sets which comes first
+* Tooltip stats in F2 Setup: a checklist of Average, Maximum, Minimum, p50, p90 and p99
+* The tooltip says how many samples a bar holds; with one (1 min bars of a 60 s recording), every statistic is that
+  sample
+* F10 Quit fits on an 80-column screen again; clicking an empty bar pins the nearest one with data, where the marker goes
+
 What's new in version 0.2.14
 
 * Each opt-in metric (temperature, CPU power, battery draw) is off, record only (recorded, no graph tab) or on

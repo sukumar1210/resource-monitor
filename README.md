@@ -104,9 +104,15 @@ leaves `/usr/local/bin` off its PATH on some systems, such as Amazon Linux).
 
 The mouse acts when the button is released: click a row, a fold marker, a column title (again to reverse), a graph
 tab, a point on the graph, or a function-bar item; the wheel scrolls the table, or moves through time over the graph.
-Hover over a bar for its tooltip: the tab's Average, Maximum and Minimum in that bar and, on Memory and CPU, the 3
-apps that used the most then. Click the bar (or press `i` for the marker's bar) to pin it: Up/Down then select its
-apps, and the table follows, unfolding and selecting each one; Esc closes it. Drag across the graph to pick a range
+Hover over a bar for its tooltip, by the pointer: the bar's statistics (Average, Maximum and Minimum, or those ticked
+under Tooltip stats in F2 Setup) with how many samples it holds, or, after `v` (or a click on a pinned tooltip's
+title), the 3 apps that used the most then on Memory and CPU. A bar holding one sample shows the same number for
+each statistic: zoom out, or sample more often. Click the bar (or press `i` for the marker's bar) to pin it: Up/Down
+then select its apps, and the table follows, unfolding and selecting each one; Esc closes it.
+
+**Kill (F9 or `k`)**, as in htop: a signal for the selected process (SIGTERM first; SIGKILL, SIGHUP, SIGINT, SIGQUIT,
+SIGUSR1, SIGUSR2, SIGSTOP, SIGCONT). It's sent only while the PID still runs the command the table shows, since a
+PID from the past may belong to another program by now; another user's process asks sudo. Drag across the graph to pick a range
 of bars for the table, as Space does. Where the terminfo only knows the old
 X10 mouse reports, which can't say a column past 223, hmon asks the terminal for SGR reports and reads them
 itself, so clicks reach every column of a wide screen.
