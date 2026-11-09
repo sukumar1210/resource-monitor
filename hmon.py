@@ -59,6 +59,7 @@ SECRETS = [
 MASKED_CHARS = 1024  # how much of a command line is masked and kept from; the patterns slow down sharply with length
 DOCKER_MAX_WAIT = 10  # most samples to skip while docker stats keeps failing, as when the daemon is stopped
 READING_SECONDS = 5  # how often the collector reads CPU, memory and swap, which each recorded row sums up
+DETAILS_SECONDS = 60  # how long a process's command line and cgroup are reused; a process can rewrite its title
 
 # Columns are only ever added at the end, and readers take the columns they know by position, so files written
 # before and after an update stay readable.
@@ -234,25 +235,30 @@ def sample_processes(ts, prev, container_names):
         procs[(int(pid), start_time)] = Process(name, int(rss_pages) * PAGE_SIZE, int(utime) + int(stime), int(ppid))
     read_at = time.monotonic()
 
+    prev_procs, prev_read_at, details, details_at = prev or ({}, None, {}, read_at)
+    if read_at - details_at >= DETAILS_SECONDS:
+        details, details_at = {}, read_at
+
     cpu_percent = {}
-    if prev:
-        prev_procs, prev_read_at = prev
-        for key, proc in procs.items():
-            if key in prev_procs:
-                cpu_seconds = (proc.cpu_ticks - prev_procs[key].cpu_ticks) / CLOCK_TICKS
-                cpu_percent[key] = round(100 * cpu_seconds / (read_at - prev_read_at), 1)
+    for key, proc in procs.items():
+        if key in prev_procs:
+            cpu_seconds = (proc.cpu_ticks - prev_procs[key].cpu_ticks) / CLOCK_TICKS
+            cpu_percent[key] = round(100 * cpu_seconds / (read_at - prev_read_at), 1)
 
     rows = []
     for key in sorted(procs, key=lambda key: procs[key].rss_bytes, reverse=True):
         pid, proc = key[0], procs[key]
         if not proc.rss_bytes and not cpu_percent.get(key):
             continue  # idle kernel thread
-        cgroup = read_text(f'/proc/{pid}/cgroup')
-        match = CONTAINER_ID.search(cgroup)
-        container = container_names.get(match.group(0), match.group(0)[:12]) if match else ''
-        rows.append([ts, pid, container, proc.name, proc.rss_bytes, cpu_percent.get(key), command_line(pid), proc.ppid,
-                     cgroup_path(cgroup)])
-    return rows, (procs, read_at)
+        known = key + (proc.name,)  # exec keeps the pid and start time, and changes the name
+        if known not in details:
+            cgroup = read_text(f'/proc/{pid}/cgroup')
+            match = CONTAINER_ID.search(cgroup)
+            details[known] = (match.group(0) if match else '', cgroup_path(cgroup), command_line(pid))
+        container_id, cgroup, command = details[known]
+        rows.append([ts, pid, container_names.get(container_id, container_id[:12]), proc.name, proc.rss_bytes,
+                     cpu_percent.get(key), command, proc.ppid, cgroup])
+    return rows, (procs, read_at, details, details_at)
 
 
 def command_line(pid):
@@ -680,6 +686,7 @@ class LiveSampler:
     def __init__(self, store):
         self.store = store
         self.prev_ticks = self.prev_procs = self.prev_energy = None
+        self.names, self.names_at = {}, None  # container id -> name, from the latest docker stats
         self.metrics = recording()[2]  # the opt-in ones the service records, read here too where this user can
 
     def pause(self):
@@ -691,14 +698,15 @@ class LiveSampler:
         now = datetime.now(timezone.utc)
         ts = now.strftime('%Y-%m-%dT%H:%M:%SZ')
         day = self.store.day_file('containers', now.strftime('%Y-%m-%d'))
-        names = {}
-        for _, rows in day.samples(max(0, len(day.times) - 1), len(day.times), 1):  # the latest docker stats
-            names.update((field(row, 10), row[1]) for row in rows if field(row, 10))
+        if day.times and day.times[-1] != self.names_at:  # none yet where there's no docker, or just after midnight
+            self.names, self.names_at = {}, day.times[-1]
+            for _, rows in day.samples(len(day.times) - 1, len(day.times), 1):
+                self.names.update((field(row, 10), row[1]) for row in rows if field(row, 10))
         host_row, self.prev_ticks = sample_host(ts, self.prev_ticks)
         if self.metrics:
             extras, self.prev_energy = sample_extras(self.metrics, self.prev_energy)
             host_row += extras
-        rows, self.prev_procs = sample_processes(ts, self.prev_procs, names)
+        rows, self.prev_procs = sample_processes(ts, self.prev_procs, self.names)
         return int(now.timestamp()), host_row, rows
 
 

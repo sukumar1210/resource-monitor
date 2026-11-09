@@ -314,6 +314,77 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(Counting.calls, 2)  # at the start and back on the newest bar, none while in the past
         self.assertIn('live', frames[-1].split('\n')[2])
 
+    def live_proc(self, files):
+        """Patches in a fake /proc of `files` (a dict the test may change) for the real LiveSampler."""
+        real_open = open
+        host = {'/proc/stat': 'cpu 100 0 50 800 50 0 0 0 0 0\n', '/proc/loadavg': '0.50 0.40 0.30 1/200 999\n',
+                '/proc/meminfo': 'MemTotal: 8000000 kB\nMemAvailable: 3000000 kB\nSwapTotal: 0 kB\nSwapFree: 0 kB\n'}
+        for patcher in (
+                mock.patch.object(hmon.os, 'listdir',
+                                  side_effect=lambda path: sorted({p.split('/')[2] for p in files})),
+                mock.patch.object(hmon, 'read_text', side_effect=lambda path: files.get(path, '')),
+                mock.patch.object(hmon, 'open', create=True, side_effect=lambda path, *a, **k: io.StringIO(
+                    host[path]) if path in host else real_open(path, *a, **k))):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_live_readings_carry_on_with_no_container_stats(self):
+        data_dir = os.path.join(self.dir.name, 'host_only')
+        with mock.patch.object(hmon, 'DATA_DIR', data_dir):
+            os.makedirs(data_dir)
+            hmon.append('host', hmon.HOST_FIELDS, [['2026-11-06T04:00:10Z', 20.0, 1.5, 8 * GiB, 4 * GiB, 0, 1, 1, 0]],
+                        '2026-11-06')
+        self.live_proc(proc_files(900, 1, 'prog', '/system.slice/prog.service', 10 * MiB, 0))
+        store = hmon.Store(data_dir)
+        screen = FakeScreen([-1, -1])
+        viewer = hmon.Viewer(screen, store, dict(hmon.DEFAULTS, tz='UTC'), hmon.LiveSampler(store), use_color=False)
+        viewer.run()
+        self.assertIsNotNone(viewer.sampler)  # no containers file is not "no /proc here"
+        self.assertIn('live', screen.frames[-1].split('\n')[2])
+
+    def test_a_refresh_rereads_command_lines_only_now_and_then(self):
+        files = proc_files(900, 1, 'prog --password hunter2', '/system.slice/prog.service', 10 * MiB, 0)
+        self.live_proc(files)
+        reads, now = [], [0]
+        sampler = hmon.LiveSampler(hmon.Store(os.path.join(self.dir.name, 'empty')))
+
+        def command(seconds):
+            now[0] = seconds
+            rows = sampler.sample()[2]
+            return next(row[6] for row in rows if row[1] == 900)
+
+        # count the reads on top of the fake /proc that live_proc patched in
+        fake_read = hmon.read_text
+
+        def counting(path):
+            reads.append(path)
+            return fake_read(path)
+
+        with mock.patch.object(hmon.time, 'monotonic', side_effect=lambda: now[0]), \
+                mock.patch.object(hmon, 'read_text', side_effect=counting):
+            self.assertEqual(command(0), 'prog --password ***')
+            files['/proc/900/cmdline'] = 'renamed\0--token\0abc'  # a process rewrites its title
+            self.assertEqual([command(2), command(4)], ['prog --password ***'] * 2)
+            self.assertEqual(reads.count('/proc/900/cmdline'), 1)
+            self.assertEqual(command(61), 'renamed --token ***')
+            self.assertEqual(reads.count('/proc/900/cmdline'), 2)
+            files.update(proc_files(900, 1, 'newprog --secret=xyz', '/system.slice/prog.service', 10 * MiB, 0))
+            self.assertEqual(command(63), 'newprog --secret=***')  # an exec shows at once
+
+    def test_a_container_name_reaches_a_live_process_row(self):
+        data_dir = os.path.join(self.dir.name, 'with_docker')
+        os.makedirs(data_dir)
+        today = hmon.datetime.now(hmon.timezone.utc).strftime('%Y-%m-%d')
+        with mock.patch.object(hmon, 'DATA_DIR', data_dir):
+            hmon.append('containers', hmon.CONTAINER_FIELDS,
+                        [[f'{today}T00:00:10Z', 'openalgo', 1.5, 320 * MiB, 8 * GiB, 0, 0, 0, 0, 3, 'c' * 64]], today)
+        self.live_proc(proc_files(900, 1, 'python app.py', f'/system.slice/docker-{"c" * 64}.scope', 10 * MiB, 0))
+        sampler = hmon.LiveSampler(hmon.Store(data_dir))
+        with mock.patch.object(hmon.DayFile, 'samples', autospec=True, side_effect=hmon.DayFile.samples) as samples:
+            self.assertEqual(sampler.sample()[2][0][2], 'openalgo')
+            self.assertEqual(sampler.sample()[2][0][2], 'openalgo')
+        self.assertEqual(samples.call_count, 1)  # no newer docker stats, so not read again
+
     def test_collect_from_a_host_then_browse_apps_and_containers(self):
         data_dir = os.path.join(self.dir.name, 'data')
         container = '7526' + 'c' * 60

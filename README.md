@@ -159,6 +159,10 @@ one at a time. A long column (a day, or an hour of 10 s samples) reads at most 2
 table, and the title says so; the graph uses every sample. A day of 10 s samples for 100 processes (98 MB) is browsed
 in about 10 MB, where loading the file would take about 120 MB. `export` and `sql` stream through temporary files.
 
+While it's open the viewer scans `/proc` every refresh, as htop does, so it costs far more than the collector, and the
+`+ hmon` row adds the two together; a longer Refresh delay in F2 Setup lowers it in proportion. A changed command line
+can take a minute or two to show.
+
 ## Dumps and queries
 
 Take a dump of an instance and analyse it anywhere:

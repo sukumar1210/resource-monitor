@@ -1,3 +1,11 @@
+What's new in version 0.2.18
+
+* A viewer refresh is lighter: it rereads a process's command line and cgroup at most once a minute, or when the
+  process runs a new program, rather than on every refresh; so does the collector
+* The viewer reads the latest docker stats only when there are newer ones
+* Live readings no longer stop for the session when the day has no container stats, as on a host without Docker or
+  just after midnight UTC
+
 What's new in version 0.2.17
 
 * Each recorded row now sums up CPU, memory and swap readings taken every 5 s, so Average, Maximum and Minimum differ
